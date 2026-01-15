@@ -1,0 +1,17 @@
+{
+  "name": "ktzh-wa-webhook",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.4.1",
+    "helmet": "^7.1.0",
+    "mongoose": "^8.10.0",
+    "pino": "^9.5.0",
+    "pino-http": "^10.4.0"
+  }
+}
