@@ -44,6 +44,10 @@ export function createApp(env) {
     const ok = mongoReady();
     res.status(ok ? 200 : 503).json({ mongo: ok });
   });
+  app.get("/privacy", (req,res)=>res.send("Privacy Policy ..."));
+app.get("/terms", (req,res)=>res.send("Terms of Service ..."));
+app.get("/data-deletion", (req,res)=>res.send("How to request data deletion ..."));
+
 
   // Webhook
   app.use(
