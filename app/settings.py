@@ -59,5 +59,5 @@ TEST_CHAT_ID = os.getenv("TEST_CHAT_ID", "77052817121").strip()
 TEST_CHAT_TYPE = os.getenv("TEST_CHAT_TYPE", "whatsapp").strip()
 
 # Ответы бота только этим chatId (через запятую): "77052817121,7777...."
-_allowed = os.getenv("ALLOWED_CHAT_IDS", "").strip()
+_allowed = os.getenv("ALLOWED_CHAT_IDS", "77052817121").strip()
 ALLOWED_CHAT_IDS = [x.strip() for x in _allowed.split(",") if x.strip()] if _allowed else []

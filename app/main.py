@@ -10,7 +10,9 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from . import settings
-from .db import init_mongo, close_mongo, mongo as mongo_global
+from . import db
+from .db import init_mongo, close_mongo
+
 from .wazzup_client import WazzupClient
 from .nlu import run_nlu
 from .dialog import (
@@ -84,10 +86,9 @@ async def debug_send(request: Request, body: DebugSend):
 @app.on_event("startup")
 async def startup():
     global wazzup
-    await init_mongo()
+    await init_mongo()          # как было
     wazzup = WazzupClient(settings.WAZZUP_API_KEY)
     await wazzup.start()
-
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -95,6 +96,7 @@ async def shutdown():
     if wazzup:
         await wazzup.close()
     await close_mongo()
+
 
 
 @app.get("/")
@@ -124,12 +126,17 @@ async def webhooks(request: Request, background: BackgroundTasks):
 
 
 async def process_payload(payload: Dict[str, Any]):
-    m = mongo_global
+    print("PROCESS PAYLOAD:", payload.keys())
+    print("MESSAGES:", len(payload.get("messages") or []))
+
+    m = db.mongo
     if m is None:
-        return
+        m = await init_mongo()
 
     messages: List[Dict[str, Any]] = payload.get("messages") or []
     statuses: List[Dict[str, Any]] = payload.get("statuses") or []
+
+
 
     # 1) store messages + bot logic
     for msg in messages:
