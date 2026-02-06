@@ -1,33 +1,66 @@
-import os
-from motor.motor_asyncio import AsyncIOMotorClient
-from dotenv import load_dotenv
+from __future__ import annotations
 
-load_dotenv()
+from dataclasses import dataclass
+from typing import Optional, Dict, Any
 
-MONGODB_URI = os.getenv("MONGODB_URI")
-DB_NAME = os.getenv("DB_NAME", "whatsapp_mess")
-COLLECTION_NAME = os.getenv("COLLECTION_NAME", "message")
+from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase, AsyncIOMotorCollection
 
-client: AsyncIOMotorClient | None = None
+from . import settings
 
+@dataclass
+class Mongo:
+    client: AsyncIOMotorClient
+    db: AsyncIOMotorDatabase
+    messages: AsyncIOMotorCollection
+    sessions: AsyncIOMotorCollection
+    cases: AsyncIOMotorCollection
 
-def get_collection():
-    if client is None:
-        raise RuntimeError("Mongo client is not initialized")
-    db = client[DB_NAME]
-    return db[COLLECTION_NAME]
+mongo: Optional[Mongo] = None
 
+async def init_mongo() -> Mongo:
+    global mongo
+    if mongo is not None:
+        return mongo
 
-async def connect_mongo():
-    global client
-    if not MONGODB_URI:
-        raise RuntimeError("MONGODB_URI is not set in .env")
-    client = AsyncIOMotorClient(MONGODB_URI)
-    col = get_collection()
+    if not settings.MONGODB_URI:
+        raise RuntimeError("MONGODB_URI is empty")
 
-    # Индексы
-    await col.create_index("messageId", unique=True, sparse=True)
-    await col.create_index("channelId")
-    await col.create_index("chatId")
-    await col.create_index("chatType")
-    await col.create_index("dateTime")
+    client = AsyncIOMotorClient(settings.MONGODB_URI)
+    db = client[settings.DB_NAME]
+
+    messages = db[settings.COL_MESSAGES]
+    sessions = db[settings.COL_SESSIONS]
+    cases = db[settings.COL_CASES]
+
+    mongo = Mongo(client=client, db=db, messages=messages, sessions=sessions, cases=cases)
+    await ensure_indexes(mongo)
+    return mongo
+
+async def close_mongo() -> None:
+    global mongo
+    if mongo and mongo.client:
+        mongo.client.close()
+    mongo = None
+
+async def ensure_indexes(m: Mongo) -> None:
+    # Drop dangerous legacy index if exists (your earlier DuplicateKeyError)
+    idx_info = await m.messages.index_information()
+    if "wa_message_id_1" in idx_info:
+        await m.messages.drop_index("wa_message_id_1")
+
+    # Primary idempotency key
+    await m.messages.create_index("messageId", unique=True, sparse=True, name="messageId_1")
+
+    # Useful query indexes
+    await m.messages.create_index([("channelId", 1), ("chatId", 1), ("dateTime", 1)], name="chat_time_1")
+    await m.messages.create_index("direction", name="direction_1")
+    await m.messages.create_index("currentStatus", name="currentStatus_1")
+
+    # Sessions unique per chat
+    await m.sessions.create_index([("channelId", 1), ("chatId", 1)], unique=True, name="session_chat_1")
+    await m.sessions.create_index("updatedAt", name="session_updatedAt_1")
+
+    # Cases
+    await m.cases.create_index("caseId", unique=True, name="caseId_1")
+    await m.cases.create_index("status", name="case_status_1")
+    await m.cases.create_index([("channelId", 1), ("chatId", 1), ("createdAt", -1)], name="case_chat_createdAt_1")
