@@ -35,9 +35,6 @@ app = FastAPI(title="KTZH Smart Bot (Wazzup webhook)")
 wazzup: Optional[WazzupClient] = None
 
 
-# ----------------------------
-# utils
-# ----------------------------
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -78,7 +75,6 @@ def _is_allowed_chat(chat_id: Optional[str]) -> bool:
 
 
 async def _send_text(channel_id: str, chat_type: str, chat_id: str, text: str, crm_id: str) -> None:
-    # безопасно: если ключа нет — просто не шлём (но код не падает)
     if not settings.BOT_SEND_ENABLED:
         return
     if not wazzup:
@@ -98,7 +94,7 @@ async def _send_text(channel_id: str, chat_type: str, chat_id: str, text: str, c
 
 
 # ----------------------------
-# “оценка смысла” + intent scoring
+# scoring / intent
 # ----------------------------
 GREET_WORDS = ["здравствуйте", "привет", "салам", "сәлем", "добрый", "ассалам"]
 THANK_WORDS = ["спасибо", "рахмет", "благодар", "алғыс"]
@@ -116,23 +112,18 @@ def _has_any(text: str, words: List[str]) -> bool:
 
 
 def _meaning_score(text: str) -> int:
-    """грубая оценка, есть ли смысл кроме 'привет'/'ок'/'7'"""
     t = (text or "").strip().lower()
     if not t:
         return 0
-    # суперкороткие/пустые ответы
     if t in ("ок", "okay", "понял", "понятно", "да", "нет", "угу", "ага"):
         return 0
-    # если только число — смысла 0 (обычно это ответ на вопрос)
     if t.isdigit():
         return 0
     score = 0
-    # длина
     if len(t) >= 10:
         score += 1
     if len(t) >= 25:
         score += 1
-    # ключевые смысловые слова
     if _has_any(t, LOST_WORDS):
         score += 2
     if _has_any(t, COMPLAINT_WORDS):
@@ -150,15 +141,11 @@ def _intent_scores(text: str, nlu_intent: str) -> Dict[str, int]:
     lost = 3 if _has_any(t, LOST_WORDS) else 0
     complaint = 3 if _has_any(t, COMPLAINT_WORDS) else 0
 
-    # если это просто приветствие — усилим greet
     if greet and _meaning_score(text) == 0 and not (lost or complaint or grat):
         greet += 2
-
-    # если есть привет + жалоба/вещи/благодарность — приветствие не основное
     if greet and (lost or complaint or grat):
         greet = 0
 
-    # подсказка из nlu
     if nlu_intent == "complaint":
         complaint += 2
     if nlu_intent == "lost_and_found":
@@ -168,7 +155,6 @@ def _intent_scores(text: str, nlu_intent: str) -> Dict[str, int]:
     if nlu_intent == "greeting":
         greet += 1
 
-    # если благодарность содержит "проводник/персонал" — это всё равно gratitude, но нужен поезд/вагон
     if grat and _has_any(t, STAFF_WORDS):
         grat += 1
 
@@ -179,13 +165,10 @@ def _choose_case_types(text: str, nlu_intent: str, active_types: Optional[Set[st
     scores = _intent_scores(text, nlu_intent)
     active_types = active_types or set()
 
-    # чистое приветствие
     if scores["greet"] >= 3 and scores["complaint"] == 0 and scores["lost_and_found"] == 0 and scores["gratitude"] == 0:
         return ["greeting"]
 
     picks: List[str] = []
-
-    # мульти-интент
     if scores["complaint"] >= 3:
         picks.append("complaint")
     if scores["lost_and_found"] >= 3:
@@ -193,9 +176,7 @@ def _choose_case_types(text: str, nlu_intent: str, active_types: Optional[Set[st
     if scores["gratitude"] >= 3 and not picks:
         picks.append("gratitude")
 
-    # если ничего не выбрали — но есть активный кейс, продолжаем его
     if not picks and active_types:
-        # предпочитаем collecting/open
         if "complaint" in active_types:
             return ["complaint"]
         if "lost_and_found" in active_types:
@@ -203,7 +184,6 @@ def _choose_case_types(text: str, nlu_intent: str, active_types: Optional[Set[st
         if "gratitude" in active_types:
             return ["gratitude"]
 
-    # fallback к NLU
     if not picks:
         if nlu_intent in ("complaint", "lost_and_found", "gratitude"):
             picks.append(nlu_intent)
@@ -336,7 +316,6 @@ async def _ensure_case(m, sess: Dict[str, Any], channel_id: str, chat_id: str, c
     if case:
         return case
 
-    # seed: если уже есть другой активный кейс — подтянем поезд/вагон (shared)
     seed: Dict[str, Any] = {}
     any_active = await load_active_case(m, sess)
     if any_active:
@@ -361,7 +340,6 @@ async def _ensure_case(m, sess: Dict[str, Any], channel_id: str, chat_id: str, c
         language=getattr(nlu, "language", "ru"),
         seed_extracted=seed,
     )
-    # хранить активный по типу
     await set_active_case(m, channel_id, chat_id, case_type, case["caseId"], make_primary=True)
     return case
 
@@ -388,9 +366,6 @@ async def process_payload(payload: Dict[str, Any]):
         direction = "outbound" if is_echo else "inbound"
         dt = _safe_parse_dt(msg.get("dateTime"))
 
-        # ----------------------------
-        # save message to Mongo (без конфликтов!)
-        # ----------------------------
         doc_insert = {"messageId": message_id, "createdAt": dt or _now_utc()}
         doc_set = {
             "channelId": channel_id,
@@ -421,9 +396,6 @@ async def process_payload(payload: Dict[str, Any]):
             print("❌ Mongo write error:", repr(e))
             return
 
-        # ----------------------------
-        # bot only inbound
-        # ----------------------------
         if direction != "inbound":
             continue
         if not (channel_id and chat_id and chat_type):
@@ -434,10 +406,8 @@ async def process_payload(payload: Dict[str, Any]):
         text = (msg.get("text") or "").strip()
         nlu = run_nlu(text) if text else run_nlu("")
 
-        # session
         sess = await ensure_session(m, channel_id, chat_id, chat_type)
 
-        # какие типы кейсов уже активны
         active_types: Set[str] = set()
         ac = sess.get("activeCases") or {}
         if isinstance(ac, dict):
@@ -445,18 +415,13 @@ async def process_payload(payload: Dict[str, Any]):
                 if v:
                     active_types.add(k)
 
-        # intent decision
         picked = _choose_case_types(text, getattr(nlu, "intent", "other"), active_types)
 
-        # 1) только приветствие — просто ответить и ВСЁ (не создаём кейс)
         if picked == ["greeting"]:
-            greet = "Здравствуйте! Чем могу помочь? Можете написать жалобу или сообщение о забытых вещах."
-            if getattr(nlu, "language", "ru") == "kk":
-                greet = "Сәлеметсіз бе! Қалай көмектесе аламын? Шағым немесе ұмытылған зат туралы жаза аласыз."
+            greet = "Здравствуйте! Чем могу помочь? Можете написать жалобу, благодарность или сообщение о забытых вещах."
             await _send_text(channel_id, chat_type, chat_id, greet, f"bot-greet-{message_id}")
             continue
 
-        # 2) если other и нет активного — уточняем
         if picked == ["other"] and not active_types:
             await _send_text(
                 channel_id, chat_type, chat_id,
@@ -465,34 +430,52 @@ async def process_payload(payload: Dict[str, Any]):
             )
             continue
 
-        # 3) создаём/берём кейсы по типам (поддержка мульти-интента)
         cases: List[Dict[str, Any]] = []
         for ct in picked:
             if ct in ("complaint", "lost_and_found", "gratitude"):
                 case = await _ensure_case(m, sess, channel_id, chat_id, chat_type, ct, msg, nlu)
                 cases.append(case)
 
-        # если вдруг picked == ["other"], но есть активный — продолжаем активный
         if not cases:
-            case = await load_active_case(m, sess)
-            if case:
-                cases = [case]
+            c = await load_active_case(m, sess)
+            if c:
+                cases = [c]
 
-        # обновим кейсы этой репликой (контекст)
-        # важно: в msg_doc передаем messageId, чтобы evidence не теряло id
         msg_doc = {**doc_set, "messageId": message_id}
         updated_cases: List[Dict[str, Any]] = []
         for c in cases:
             updated = await update_case_with_message(m, c, msg_doc, nlu, sess=sess)
             updated_cases.append(updated)
 
-        # ----------------------------
-        # SHARED QUESTION: поезд/вагон спрашиваем ОДИН РАЗ для complaint+lost
-        # ----------------------------
+        # ---- Универсальный LOST intake (если кейс ТОЛЬКО lost_and_found и не хватает базовых полей)
+        if len(updated_cases) == 1 and updated_cases[0].get("caseType") == "lost_and_found":
+            miss = required_slots(updated_cases[0])
+            if "train" in miss or "carNumber" in miss or "seat" in miss or "when" in miss:
+                q = (
+                    "Понял(а). Чтобы быстрее найти вещь, напишите одним сообщением:\n"
+                    "• номер поезда (Т58)\n"
+                    "• номер вагона\n"
+                    "• место (если помните, иначе «не помню»)\n"
+                    "• что за вещь и приметы (цвет/бренд/что внутри)\n"
+                    "• когда примерно оставили\n\n"
+                    "Пример: «Т58, вагон 7, место 12, черная сумка Adidas, вчера 19:30»."
+                )
+                await _send_text(channel_id, chat_type, chat_id, q, f"bot-lf-intake-{message_id}")
+                await set_pending(
+                    m,
+                    channel_id=channel_id,
+                    chat_id=chat_id,
+                    question=q,
+                    slot="lf_intake",
+                    targets=["lost_and_found"],
+                    pending_case_type="lost_and_found",
+                )
+                continue
+
+        # ---- SHARED train/car для complaint+lost (вместе)
         need_shared_train = False
         need_shared_car = False
-        need_shared_targets: List[str] = []
-
+        targets: List[str] = []
         for c in updated_cases:
             if c.get("caseType") in ("complaint", "lost_and_found"):
                 ex = c.get("extracted") or {}
@@ -500,32 +483,31 @@ async def process_payload(payload: Dict[str, Any]):
                     need_shared_train = True
                 if not ex.get("carNumber"):
                     need_shared_car = True
-                if c.get("caseType") not in need_shared_targets:
-                    need_shared_targets.append(c.get("caseType"))
+                if c.get("caseType") not in targets:
+                    targets.append(c.get("caseType"))
 
-        if need_shared_targets and (need_shared_train or need_shared_car):
-            q = "Уточните, пожалуйста, номер поезда и номер вагона (можно одним сообщением: «Т58, вагон 7»)."
+        if targets and (need_shared_train or need_shared_car):
+            q = (
+                "Уточните, пожалуйста, номер поезда и номер вагона (можно одним сообщением: «Т58, вагон 7»).\n"
+                "Если это про забытые вещи — можете сразу добавить место и описание вещи."
+            )
             await _send_text(channel_id, chat_type, chat_id, q, f"bot-q-shared-{message_id}")
             await set_pending(
                 m,
                 channel_id=channel_id,
                 chat_id=chat_id,
                 question=q,
-                slot="train_car",                 # специальный pending для общего
-                targets=need_shared_targets,      # на кого распространяется
+                slot="train_car",
+                targets=targets,
                 pending_case_type="shared",
             )
             continue
 
-        # ----------------------------
-        # если shared не нужен — задаем вопросы по каждому кейсу
-        # ----------------------------
+        # ---- по одному вопросу (чтобы не спамить)
+        asked = False
         for c in updated_cases:
             missing = required_slots(c)
-
             if missing:
-                # спрашиваем 1 вопрос за раз на кейс, но:
-                # - для lost_and_found seat/item/when -> build_question вернет lf_bundle
                 q, slot = build_question(c, missing[0])
                 await _send_text(channel_id, chat_type, chat_id, q, f"bot-q-{c['caseId']}-{message_id}")
                 await set_pending(
@@ -537,47 +519,49 @@ async def process_payload(payload: Dict[str, Any]):
                     targets=[c.get("caseType")],
                     pending_case_type=c.get("caseType"),
                 )
-                break  # важно: не спамим вопросами — 1 вопрос на сообщение
-        else:
-            # ----------------------------
-            # если вопросов нет — диспатчим/закрываем все готовые кейсы
-            # ----------------------------
-            for c in updated_cases:
-                ct = c.get("caseType")
+                asked = True
+                break
 
-                if ct == "complaint":
-                    ex = c.get("extracted", {}) or {}
-                    region = resolve_region(ex.get("train"), ex.get("routeFrom"), ex.get("routeTo"))
-                    executor = resolve_executor(region)
+        if asked:
+            continue
 
-                    if executor.target_chat_id and executor.target_chat_type:
-                        await _send_text(
-                            channel_id=channel_id,
-                            chat_type=executor.target_chat_type,
-                            chat_id=executor.target_chat_id,
-                            text=format_dispatch_text(c) + f"\nРегион: {executor.region}",
-                            crm_id=f"bot-complaint-{c['caseId']}",
-                        )
+        # ---- dispatch/finalize
+        for c in updated_cases:
+            ct = c.get("caseType")
 
-                    await _send_text(channel_id, chat_type, chat_id, format_user_ack(c), f"bot-complaint-ack-{message_id}")
-                    await close_case(m, c["caseId"], status="sent")
+            if ct == "complaint":
+                ex = c.get("extracted", {}) or {}
+                region = resolve_region(ex.get("train"), ex.get("routeFrom"), ex.get("routeTo"))
+                executor = resolve_executor(region)
 
-                elif ct == "lost_and_found":
-                    if settings.LOST_FOUND_TARGET:
-                        await _send_text(
-                            channel_id=channel_id,
-                            chat_type=settings.LOST_FOUND_TARGET.get("chatType", "whatsgroup"),
-                            chat_id=settings.LOST_FOUND_TARGET.get("chatId", chat_id),
-                            text=format_dispatch_text(c),
-                            crm_id=f"bot-lf-{c['caseId']}",
-                        )
+                if executor.target_chat_id and executor.target_chat_type:
+                    await _send_text(
+                        channel_id=channel_id,
+                        chat_type=executor.target_chat_type,
+                        chat_id=executor.target_chat_id,
+                        text=format_dispatch_text(c) + f"\nРегион: {executor.region}",
+                        crm_id=f"bot-complaint-{c['caseId']}",
+                    )
 
-                    await _send_text(channel_id, chat_type, chat_id, format_user_ack(c), f"bot-lf-ack-{message_id}")
-                    await close_case(m, c["caseId"], status="sent")
+                await _send_text(channel_id, chat_type, chat_id, format_user_ack(c), f"bot-complaint-ack-{message_id}")
+                await close_case(m, c["caseId"], status="sent")
 
-                elif ct == "gratitude":
-                    await _send_text(channel_id, chat_type, chat_id, format_user_ack(c), f"bot-grat-ack-{message_id}")
-                    await close_case(m, c["caseId"], status="closed")
+            elif ct == "lost_and_found":
+                if settings.LOST_FOUND_TARGET:
+                    await _send_text(
+                        channel_id=channel_id,
+                        chat_type=settings.LOST_FOUND_TARGET.get("chatType", "whatsgroup"),
+                        chat_id=settings.LOST_FOUND_TARGET.get("chatId", chat_id),
+                        text=format_dispatch_text(c),
+                        crm_id=f"bot-lf-{c['caseId']}",
+                    )
+
+                await _send_text(channel_id, chat_type, chat_id, format_user_ack(c), f"bot-lf-ack-{message_id}")
+                await close_case(m, c["caseId"], status="sent")
+
+            elif ct == "gratitude":
+                await _send_text(channel_id, chat_type, chat_id, format_user_ack(c), f"bot-grat-ack-{message_id}")
+                await close_case(m, c["caseId"], status="closed")
 
     # statuses
     for st in statuses:
