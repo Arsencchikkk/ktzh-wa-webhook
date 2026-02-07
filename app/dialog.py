@@ -168,13 +168,16 @@ class DialogManager:
 
     async def handle(self, chat_id_hash: str, chat_meta: Dict[str, Any], user_text: str) -> BotReply:
         session = await self._load_session(chat_id_hash)
-        _, is_angry, is_flood = detect_aggression_and_flood(session, user_text)
-        nlu_res = self.nlu.analyze(user_text or "")
 
-        if nlu_res.cancel:
-            self._close_all_cases(session, reason="user_cancel")
-            await self._save_session(chat_id_hash, session)
-            return BotReply(text="Ок, остановил. Если нужно — напишите снова.")
+session, is_angry, is_flood = detect_aggression_and_flood(session, user_text)
+
+nlu_res = self.nlu.analyze(user_text or "")
+
+if nlu_res.cancel:
+    self._close_all_cases(session, reason="user_cancel")
+    await self._save_session(chat_id_hash, session)
+    return BotReply(text="Ок, остановил. Если нужно — напишите снова.")
+
 
         # ... ДАЛЬШЕ ТВОЯ ЛОГИКА ПОЧТИ БЕЗ ИЗМЕНЕНИЙ ...
         # только все self._save_session(...) -> await self._save_session(...)
