@@ -109,6 +109,9 @@ async def _process_items(items: list, background: BackgroundTasks) -> None:
 
 # ✅ ДВА маршрута: /webhooks и /webhook/wazzup
 @app.post("/webhooks")
+async def webhooks_alias(request: Request):
+    return await wazzup_webhook(request)
+
 @app.post("/webhook/wazzup")
 async def wazzup_webhook(request: Request, background: BackgroundTasks):
     _check_token(request)
