@@ -127,12 +127,6 @@ def _merge_extracted(extracted: Dict[str, Any], nlu: Any, message_doc: Dict[str,
 
 
 async def ensure_session(m, channel_id: str, chat_id: str, chat_type: str) -> Dict[str, Any]:
-    """
-    Session remembers:
-    - activeCaseId
-    - pendingSlot/pendingQuestion
-    - draftSlots (train/wagon before user tells type)
-    """
     now = _now_utc()
     await m.sessions.update_one(
         {"channelId": channel_id, "chatId": chat_id},
@@ -140,7 +134,6 @@ async def ensure_session(m, channel_id: str, chat_id: str, chat_type: str) -> Di
             "$setOnInsert": {
                 "channelId": channel_id,
                 "chatId": chat_id,
-                "chatType": chat_type,
                 "createdAt": now,
                 "draftSlots": {},
             },
@@ -153,6 +146,7 @@ async def ensure_session(m, channel_id: str, chat_id: str, chat_type: str) -> Di
     )
     sess = await m.sessions.find_one({"channelId": channel_id, "chatId": chat_id})
     return sess or {}
+
 
 
 async def load_active_case(m, session: Dict[str, Any]) -> Optional[Dict[str, Any]]:
