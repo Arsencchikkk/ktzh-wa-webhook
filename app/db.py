@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from pymongo import MongoClient, ReturnDocument
 from pymongo.collection import Collection
 
-from settings import settings
+from .settings import settings
 
 
 def utcnow() -> datetime:
@@ -21,12 +21,10 @@ class MongoStore:
         self.sessions: Collection = self.db[settings.COL_SESSIONS]
         self.cases: Collection = self.db[settings.COL_CASES]
 
-        # indexes (safe to call repeatedly)
         self.sessions.create_index("chatIdHash", unique=True)
         self.cases.create_index([("chatIdHash", 1), ("status", 1), ("type", 1)])
         self.messages.create_index([("chatIdHash", 1), ("dateTime", 1)])
 
-    # ---------- sessions ----------
     def get_session(self, chat_id_hash: str) -> Optional[Dict[str, Any]]:
         return self.sessions.find_one({"chatIdHash": chat_id_hash})
 
@@ -47,26 +45,18 @@ class MongoStore:
                 "pending": {"slots": [], "bundle": None, "caseTypes": []},
                 "cases": {},
                 "lastBot": {"text": None, "askedSlots": []},
+                "moderation": {"tone": "neutral", "angry": False, "flooding": False, "repeat_count": 0, "prev_text": None},
                 "updatedAt": utcnow(),
             }},
             upsert=True,
         )
 
-    # ---------- messages ----------
     def add_message(self, doc: Dict[str, Any]) -> None:
         doc.setdefault("createdAt", utcnow())
         self.messages.insert_one(doc)
 
-    # ---------- cases ----------
     def create_case(self, chat_id_hash: str, case_type: str, payload: Dict[str, Any]) -> str:
-        """
-        Creates a local case record (not an external CRM ticket).
-        Returns generated ticketId.
-        """
-        ticket_id = payload.get("ticketId")
-        if not ticket_id:
-            ticket_id = self._gen_ticket_id(case_type)
-
+        ticket_id = payload.get("ticketId") or self._gen_ticket_id(case_type)
         doc = {
             "ticketId": ticket_id,
             "chatIdHash": chat_id_hash,
@@ -79,14 +69,14 @@ class MongoStore:
         self.cases.insert_one(doc)
         return ticket_id
 
-    def close_case(self, chat_id_hash: str, ticket_id: str) -> None:
-        self.cases.update_one(
-            {"chatIdHash": chat_id_hash, "ticketId": ticket_id},
-            {"$set": {"status": "closed", "updatedAt": utcnow()}}
-        )
+    def close_open_cases(self, chat_id_hash: str, case_type: Optional[str] = None) -> int:
+        q: Dict[str, Any] = {"chatIdHash": chat_id_hash, "status": "open"}
+        if case_type:
+            q["type"] = case_type
+        res = self.cases.update_many(q, {"$set": {"status": "closed", "updatedAt": utcnow()}})
+        return int(res.modified_count)
 
     def _gen_ticket_id(self, case_type: str) -> str:
-        # Example: KTZH-20260207-LOST-8F21C2A1
         import secrets
         from datetime import datetime
         dt = datetime.utcnow().strftime("%Y%m%d")
