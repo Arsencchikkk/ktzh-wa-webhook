@@ -1,76 +1,95 @@
 from __future__ import annotations
+from typing import Any, Dict, Optional
+from datetime import datetime, timezone
+from pymongo import MongoClient, ReturnDocument
+from pymongo.collection import Collection
 
-from dataclasses import dataclass
-from typing import Optional, Dict, Any
+from settings import settings
 
-from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase, AsyncIOMotorCollection
 
-from . import settings
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
-@dataclass
-class Mongo:
-    client: AsyncIOMotorClient
-    db: AsyncIOMotorDatabase
-    messages: AsyncIOMotorCollection
-    sessions: AsyncIOMotorCollection
-    cases: AsyncIOMotorCollection
 
-mongo: Optional[Mongo] = None
+class MongoStore:
+    def __init__(self) -> None:
+        if not settings.MONGODB_URI:
+            raise RuntimeError("MONGODB_URI is empty. Set it in ENV for Render/local.")
+        self.client = MongoClient(settings.MONGODB_URI)
+        self.db = self.client[settings.DB_NAME]
+        self.messages: Collection = self.db[settings.COL_MESSAGES]
+        self.sessions: Collection = self.db[settings.COL_SESSIONS]
+        self.cases: Collection = self.db[settings.COL_CASES]
 
-async def init_mongo() -> Mongo:
-    global mongo
-    if mongo is not None:
-        return mongo
+        # indexes (safe to call repeatedly)
+        self.sessions.create_index("chatIdHash", unique=True)
+        self.cases.create_index([("chatIdHash", 1), ("status", 1), ("type", 1)])
+        self.messages.create_index([("chatIdHash", 1), ("dateTime", 1)])
 
-    if not settings.MONGODB_URI:
-        raise RuntimeError("MONGODB_URI is empty")
+    # ---------- sessions ----------
+    def get_session(self, chat_id_hash: str) -> Optional[Dict[str, Any]]:
+        return self.sessions.find_one({"chatIdHash": chat_id_hash})
 
-    client = AsyncIOMotorClient(settings.MONGODB_URI)
-    db = client[settings.DB_NAME]
+    def upsert_session(self, chat_id_hash: str, patch: Dict[str, Any]) -> Dict[str, Any]:
+        patch["updatedAt"] = utcnow()
+        return self.sessions.find_one_and_update(
+            {"chatIdHash": chat_id_hash},
+            {"$set": patch, "$setOnInsert": {"createdAt": utcnow(), "chatIdHash": chat_id_hash}},
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
 
-    messages = db[settings.COL_MESSAGES]
-    sessions = db[settings.COL_SESSIONS]
-    cases = db[settings.COL_CASES]
+    def reset_session(self, chat_id_hash: str) -> None:
+        self.sessions.update_one(
+            {"chatIdHash": chat_id_hash},
+            {"$set": {
+                "shared": {"train": None, "carNumber": None},
+                "pending": {"slots": [], "bundle": None, "caseTypes": []},
+                "cases": {},
+                "lastBot": {"text": None, "askedSlots": []},
+                "updatedAt": utcnow(),
+            }},
+            upsert=True,
+        )
 
-    mongo = Mongo(client=client, db=db, messages=messages, sessions=sessions, cases=cases)
-    await ensure_indexes(mongo)
-    return mongo
+    # ---------- messages ----------
+    def add_message(self, doc: Dict[str, Any]) -> None:
+        doc.setdefault("createdAt", utcnow())
+        self.messages.insert_one(doc)
 
-async def close_mongo() -> None:
-    global mongo
-    if mongo and mongo.client:
-        mongo.client.close()
-    mongo = None
+    # ---------- cases ----------
+    def create_case(self, chat_id_hash: str, case_type: str, payload: Dict[str, Any]) -> str:
+        """
+        Creates a local case record (not an external CRM ticket).
+        Returns generated ticketId.
+        """
+        ticket_id = payload.get("ticketId")
+        if not ticket_id:
+            ticket_id = self._gen_ticket_id(case_type)
 
-async def ensure_indexes(m: Mongo) -> None:
-    idx_info = await m.messages.index_information()
+        doc = {
+            "ticketId": ticket_id,
+            "chatIdHash": chat_id_hash,
+            "type": case_type,
+            "status": "open",
+            "payload": payload,
+            "createdAt": utcnow(),
+            "updatedAt": utcnow(),
+        }
+        self.cases.insert_one(doc)
+        return ticket_id
 
-    # 1) drop legacy unique indexes that break inserts (null duplicates)
-    for name, spec in idx_info.items():
-        keys = spec.get("key") or []
-        key_fields = [k for k, _ in keys]
+    def close_case(self, chat_id_hash: str, ticket_id: str) -> None:
+        self.cases.update_one(
+            {"chatIdHash": chat_id_hash, "ticketId": ticket_id},
+            {"$set": {"status": "closed", "updatedAt": utcnow()}}
+        )
 
-        if ("wa_message_id" in key_fields) or ("waMessageId" in key_fields):
-            await m.messages.drop_index(name)
-
-    # (на всякий) дроп по имени, если вдруг есть
-    idx_info = await m.messages.index_information()
-    if "wa_message_id_1" in idx_info:
-        await m.messages.drop_index("wa_message_id_1")
-
-    # 2) our idempotency key
-    await m.messages.create_index("messageId", unique=True, sparse=True, name="messageId_1")
-
-    # useful query indexes
-    await m.messages.create_index([("channelId", 1), ("chatId", 1), ("dateTime", 1)], name="chat_time_1")
-    await m.messages.create_index("direction", name="direction_1")
-    await m.messages.create_index("currentStatus", name="currentStatus_1")
-
-    # Sessions unique per chat
-    await m.sessions.create_index([("channelId", 1), ("chatId", 1)], unique=True, name="session_chat_1")
-    await m.sessions.create_index("updatedAt", name="session_updatedAt_1")
-
-    # Cases
-    await m.cases.create_index("caseId", unique=True, name="caseId_1")
-    await m.cases.create_index("status", name="case_status_1")
-    await m.cases.create_index([("channelId", 1), ("chatId", 1), ("createdAt", -1)], name="case_chat_createdAt_1")
+    def _gen_ticket_id(self, case_type: str) -> str:
+        # Example: KTZH-20260207-LOST-8F21C2A1
+        import secrets
+        from datetime import datetime
+        dt = datetime.utcnow().strftime("%Y%m%d")
+        suffix = secrets.token_hex(4).upper()
+        prefix = "LOST" if case_type == "lost_and_found" else ("THANKS" if case_type == "gratitude" else "CMP")
+        return f"KTZH-{dt}-{prefix}-{suffix}"
