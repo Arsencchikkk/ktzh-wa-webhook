@@ -17,6 +17,17 @@ def _get_json(name: str, default: Any) -> Any:
     except Exception:
         return default
 
+
+LLM_ENABLED = env_bool("LLM_ENABLED", False)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini").strip()
+LLM_TIMEOUT_SEC = int(os.getenv("LLM_TIMEOUT_SEC", "6"))
+LLM_STORE = env_bool("LLM_STORE", False)  # Рекомендовано false
+LLM_CONFIDENCE_THRESHOLD = int(os.getenv("LLM_CONFIDENCE_THRESHOLD", "60"))  # 0..100
+LLM_MAX_HISTORY = int(os.getenv("LLM_MAX_HISTORY", "12"))
+LLM_MAX_TEXT_CHARS = int(os.getenv("LLM_MAX_TEXT_CHARS", "800"))
+
+
 # Mongo
 MONGODB_URI = os.getenv("MONGODB_URI", "").strip()
 DB_NAME = os.getenv("DB_NAME", "ktzh").strip()
