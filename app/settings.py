@@ -1,63 +1,64 @@
 from __future__ import annotations
-
 import os
 from dataclasses import dataclass
-from dotenv import load_dotenv
-
-load_dotenv()
 
 
-def env_str(name: str, default: str | None = None) -> str | None:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    v = v.strip()
-    return v if v != "" else default
+def env_str(key: str, default: str = "") -> str:
+    v = os.getenv(key)
+    return v if v is not None else default
 
 
-def env_int(name: str, default: int) -> int:
-    v = os.getenv(name)
-    if v is None or v.strip() == "":
+def env_int(key: str, default: int = 0) -> int:
+    v = os.getenv(key)
+    if v is None or v == "":
         return default
     try:
-        return int(v.strip())
-    except ValueError:
+        return int(v)
+    except Exception:
         return default
 
 
-def env_bool(name: str, default: bool = False) -> bool:
-    v = os.getenv(name)
-    if v is None:
+def env_bool(key: str, default: bool = False) -> bool:
+    v = os.getenv(key)
+    if v is None or v == "":
         return default
-    s = v.strip().lower()
-    if s in {"1", "true", "t", "yes", "y", "on"}:
-        return True
-    if s in {"0", "false", "f", "no", "n", "off"}:
-        return False
-    return default
+    v = v.strip().lower()
+    return v in ("1", "true", "yes", "y", "on")
 
 
 @dataclass(frozen=True)
 class Settings:
-    APP_NAME: str = env_str("APP_NAME", "ktzh-wazzup-bot") or "ktzh-wazzup-bot"
-
-    # Wazzup
-    WAZZUP_API_KEY: str | None = env_str("WAZZUP_API_KEY", None)
-    WAZZUP_BASE_URL: str = env_str("WAZZUP_BASE_URL", "https://api.wazzup24.com") or "https://api.wazzup24.com"
-    WEBHOOK_TOKEN: str | None = env_str("WEBHOOK_TOKEN", None)
-    BOT_SEND_ENABLED: bool = env_bool("BOT_SEND_ENABLED", True)
-
-    # Hashing / privacy
-    PHONE_HASH_SALT: str = env_str("PHONE_HASH_SALT", "dev-salt") or "dev-salt"
+    APP_NAME: str = env_str("APP_NAME", "KTZH Smart Bot")
 
     # Mongo
-    MONGODB_URI: str | None = env_str("MONGODB_URI", None)
-    DB_NAME: str = env_str("DB_NAME", "ktzh_bot") or "ktzh_bot"
-    COL_MESSAGES: str = env_str("COL_MESSAGES", "messages") or "messages"
-    COL_SESSIONS: str = env_str("COL_SESSIONS", "sessions") or "sessions"
-    COL_CASES: str = env_str("COL_CASES", "cases") or "cases"
+    MONGO_URI: str = env_str("MONGO_URI", "")
+    MONGO_DB: str = env_str("MONGO_DB", "ktzh_bot")
+    MONGO_SESSIONS_COLLECTION: str = env_str("MONGO_SESSIONS_COLLECTION", "sessions")
+    MONGO_MESSAGES_COLLECTION: str = env_str("MONGO_MESSAGES_COLLECTION", "messages")
 
-    
+    # Wazzup
+    WAZZUP_API_URL: str = env_str("WAZZUP_API_URL", "https://api.wazzup24.com/v3")
+    WAZZUP_API_KEY: str = env_str("WAZZUP_API_KEY", "")
+
+    # Webhook auth
+    WEBHOOK_TOKEN: str = env_str("WEBHOOK_TOKEN", "")
+
+    # Behavior
+    BOT_SEND_ENABLED: bool = env_bool("BOT_SEND_ENABLED", True)
+    PHONE_HASH_SALT: str = env_str("PHONE_HASH_SALT", "change_me")
+
+    # Dialog tuning
+    MEANING_MIN_SCORE: int = env_int("MEANING_MIN_SCORE", 2)
+    MAX_HISTORY: int = env_int("MAX_HISTORY", 20)
+    FLOOD_WINDOW_SEC: int = env_int("FLOOD_WINDOW_SEC", 8)
+    FLOOD_MAX_MSG: int = env_int("FLOOD_MAX_MSG", 4)
+
+    # Optional LLM (off by default)
+    LLM_ENABLED: bool = env_bool("LLM_ENABLED", False)
+    OPENAI_API_KEY: str = env_str("OPENAI_API_KEY", "")
+    LLM_MODEL: str = env_str("LLM_MODEL", "gpt-4o-mini")
+    LLM_TIMEOUT_SEC: int = env_int("LLM_TIMEOUT_SEC", 6)
+    LLM_STORE: bool = env_bool("LLM_STORE", False)
 
 
 settings = Settings()
