@@ -13,7 +13,7 @@ from .wazzup_client import WazzupClient
 app = FastAPI(title=settings.APP_NAME)
 store = MongoStore()
 dialog = DialogManager(store)
-wazzup = WazzupClient()
+wazzup = WazzupClient(settings.WAZZUP_API_KEY)
 
 
 def chat_hash(chat_id: str) -> str:
