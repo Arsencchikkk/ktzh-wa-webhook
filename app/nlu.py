@@ -5,233 +5,122 @@ from typing import Any, Dict, List, Optional, Tuple
 import re
 import time
 
-from .settings import settings
-
-
-# -------------------------
-# Normalization / tokens
-# -------------------------
 
 def normalize(text: str) -> str:
     t = (text or "").strip().lower()
-    return t.replace("ё", "е")
-
-
-def _tokens(text: str) -> List[str]:
-    t = normalize(text)
-    return re.findall(r"[a-zа-я0-9]+", t)
-
-
-# -------------------------
-# Simple regex extractors
-# -------------------------
-
-RE_TRAIN = re.compile(r"(?i)\b[тt]\s*[-]?\s*(\d{1,4})\b")
-RE_CAR = re.compile(r"(?i)\b(\d{1,2})\s*(вагон|вгн|ваг)\b|\bвагон\s*(\d{1,2})\b")
-RE_NUM = re.compile(r"\b(\d{1,4})\b")
+    t = t.replace("ё", "е")
+    return t
 
 
 def extract_train_and_car(text: str) -> Tuple[Optional[str], Optional[int]]:
     t = normalize(text)
 
     train = None
-    m = RE_TRAIN.search(t)
-    if m:
-        train = f"T{m.group(1)}"
-
     car = None
-    m2 = RE_CAR.search(t)
-    if m2:
-        for g in m2.groups():
-            if g and g.isdigit():
-                v = int(g)
-                if 1 <= v <= 99:
-                    car = v
-                    break
+
+    # Т58 / T58 / т 58
+    m = re.search(r"\b[тt]\s*[-]?\s*(\d{1,4})\b", t)
+    if m:
+        train = f"Т{m.group(1)}"
+
+    # вагон 9 / 9 вагон
+    m = re.search(r"\bвагон\s*(\d{1,2})\b|\b(\d{1,2})\s*вагон\b", t)
+    if m:
+        num = next((g for g in m.groups() if g), None)
+        if num:
+            car = int(num)
 
     return train, car
 
 
-# -------------------------
-# Aggression & Flood
-# -------------------------
-
-_SWEAR = {
-    "тупой", "идиот", "дебил", "сука", "бляд", "нахуй", "хуй", "пизд",
-    "fuck", "shit"
-}
-
-
-def _aggression_score(text: str) -> int:
+def detect_aggression_and_flood(session: Dict[str, Any], text: str) -> Tuple[Dict[str, Any], bool, bool]:
     t = normalize(text)
-    toks = set(_tokens(t))
-    sc = 0
-    if any(w in t for w in _SWEAR) or any(w in toks for w in _SWEAR):
-        sc += 2
-    if text and sum(1 for c in text if c.isupper()) >= 10:
-        sc += 1
-    if "!!!" in (text or ""):
-        sc += 1
-    return sc
 
+    mod = session.get("moderation") or {}
+    now = time.time()
 
-def detect_aggression_and_flood(
-    session: Dict[str, Any],
-    text: str,
-    now: Optional[float] = None,
-) -> Tuple[int, bool, bool]:
-    """
-    Обновляет session["aggression"] и session["flood"].
-    Возвращает: (aggression_level, is_angry, is_flood)
-    """
-    if now is None:
-        now = time.time()
+    prev_text = mod.get("prev_text")
+    repeat = mod.get("repeat_count", 0)
 
-    # aggression
-    aggr = int(session.get("aggression", 0))
-    aggr = max(0, aggr - 1)  # небольшой decay
-    aggr += _aggression_score(text)
-    session["aggression"] = aggr
-    is_angry = aggr >= 2
+    if prev_text and prev_text == t:
+        repeat += 1
+    else:
+        repeat = 0
 
-    # flood
-    flood = session.get("flood") or {"window_start": now, "count": 0}
-    ws = float(flood.get("window_start", now))
-    if now - ws > getattr(settings, "FLOOD_WINDOW_SEC", 8):
-        flood["window_start"] = now
-        flood["count"] = 0
-    flood["count"] = int(flood.get("count", 0)) + 1
-    session["flood"] = flood
+    # flood: много одинаковых/частых сообщений
+    last_ts = mod.get("last_ts", 0.0)
+    dt = now - float(last_ts or 0.0)
+    flooding = (dt < 2.0 and len(t) < 30) or repeat >= 2
 
-    max_msg = getattr(settings, "FLOOD_MAX_MSG", 4)
-    is_flood = int(flood["count"]) >= max_msg
+    # aggression: грубые слова (минимально)
+    angry_words = ("дебил", "идиот", "сука", "блять", "тупой", "прекрати")
+    angry = any(w in t for w in angry_words)
 
-    return aggr, is_angry, is_flood
+    mod["prev_text"] = t
+    mod["repeat_count"] = repeat
+    mod["last_ts"] = now
+    session["moderation"] = mod
 
-
-# -------------------------
-# Rule-based NLU object
-# -------------------------
-
-_GREETINGS = {
-    "здравствуйте", "здрасти", "привет", "салам", "сәлем",
-    "hello", "hi", "hey",
-    "добрый день", "доброе утро", "добрый вечер",
-}
-
-_THANK = {"спасибо", "благодарю", "благодарность", "рахмет", "thx", "thanks"}
-_LOST = {"потерял", "потеряла", "забыл", "забыла", "оставил", "оставила", "забыли", "оставили", "пропал", "пропала"}
-_DELAY = {"опоздал", "опоздание", "задержка", "задержали", "задержался", "час", "минут", "мин"}
-_COMPLAINT = {"жалоба", "плохо", "ужас", "хам", "хамство", "груб", "гряз", "слом", "не работает"}
-_CANCEL = {"отмена", "отменить", "закройте", "закрыть", "не актуально", "неактуально", "нашлась", "нашел", "нашёл", "нашла", "нашли"}
-
-
-def _is_greeting_only(text: str) -> bool:
-    t = normalize(text)
-    if not t:
-        return False
-    t = re.sub(r"[^\w\s]", " ", t)
-    t = " ".join(t.split())
-    if t in _GREETINGS:
-        return True
-    toks = _tokens(t)
-    if len(toks) <= 2 and any("привет" in x or "здрав" in x or x in ("hi", "hello") for x in toks):
-        return True
-    return False
-
-
-def _meaning_score(text: str) -> int:
-    t = normalize(text)
-    toks = set(_tokens(t))
-    sc = 0
-
-    if any(w in toks for w in _THANK):
-        sc += 2
-    if any(w in toks for w in _LOST):
-        sc += 2
-    if any(w in toks for w in _DELAY):
-        sc += 2
-    if any(w in toks for w in _COMPLAINT):
-        sc += 1
-
-    tr, car = extract_train_and_car(t)
-    if tr:
-        sc += 2
-    if car is not None:
-        sc += 2
-
-    if len(_tokens(t)) <= 3 and RE_NUM.search(t):
-        sc += 1
-
-    return sc
-
-
-def _detect_intents(text: str) -> List[str]:
-    t = normalize(text)
-    toks = set(_tokens(t))
-
-    has_thanks = any(w in toks for w in _THANK)
-    has_lost = any(w in toks for w in _LOST)
-    has_delay = any(w in toks for w in _DELAY)
-    has_compl = any(w in toks for w in _COMPLAINT) or "жалоб" in t
-
-    # Если чистая благодарность — НЕ делаем жалобу
-    if has_thanks and not (has_lost or has_delay or has_compl):
-        return ["gratitude"]
-
-    intents: List[str] = []
-    if has_lost:
-        intents.append("lost")
-    if has_delay or has_compl:
-        intents.append("complaint")
-    if has_thanks:
-        intents.append("gratitude")
-
-    # уникальность
-    out = []
-    for i in intents:
-        if i not in out:
-            out.append(i)
-    return out
-
-
-def _is_cancel(text: str) -> bool:
-    t = normalize(text)
-    return any(w in t for w in _CANCEL)
+    return session, angry, flooding
 
 
 @dataclass
-class NLUResult:
+class NluResult:
+    intents: List[str]
+    slots: Dict[str, Any]
     greeting_only: bool
     cancel: bool
     meaning_score: int
-    intents: List[str]
-    slots: Dict[str, Any]
 
 
-class RuleNLU:
-    def analyze(self, text: str) -> NLUResult:
-        greeting = _is_greeting_only(text)
-        cancel = _is_cancel(text)
-        ms = _meaning_score(text)
-        intents = _detect_intents(text)
-        tr, car = extract_train_and_car(text)
+class SimpleNLU:
+    def analyze(self, text: str) -> NluResult:
+        t = normalize(text)
 
+        # cancel words
+        cancel_words = ("стоп", "отмена", "прекрати", "хватит", "закрой", "не надо")
+        cancel = any(w in t for w in cancel_words)
+
+        # greeting
+        greeting = bool(re.search(r"\b(привет|здравствуйте|здрасьте|добрый\s*(день|вечер|утро)|салам)\b", t))
+
+        # intents
+        intents: List[str] = []
+        if any(k in t for k in ("благодар", "поблагодар", "спасибо", "рахмет")):
+            intents.append("gratitude")
+
+        if any(k in t for k in ("потерял", "забыл", "оставил", "пропал", "вещ", "сумк", "рюкзак", "чемодан")):
+            intents.append("lost")
+
+        if any(k in t for k in ("жалоб", "опозд", "задерж", "ужас", "грязн", "хам", "не работает", "сломал", "плохо")):
+            intents.append("complaint")
+
+        train, car = extract_train_and_car(t)
         slots: Dict[str, Any] = {}
-        if tr:
-            slots["train"] = tr
+        if train:
+            slots["train"] = train
         if car is not None:
             slots["car"] = car
 
-        return NLUResult(
-            greeting_only=greeting,
-            cancel=cancel,
-            meaning_score=ms,
+        # meaning score
+        score = 0
+        if intents:
+            score += 2
+        if train or car is not None:
+            score += 1
+        if len(t) >= 12:
+            score += 1
+
+        greeting_only = greeting and not intents and not slots and len(t.split()) <= 2
+
+        return NluResult(
             intents=intents,
             slots=slots,
+            greeting_only=greeting_only,
+            cancel=cancel,
+            meaning_score=score,
         )
 
 
-def build_nlu() -> RuleNLU:
-    return RuleNLU()
-
+def build_nlu() -> SimpleNLU:
+    return SimpleNLU()
