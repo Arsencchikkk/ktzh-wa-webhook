@@ -10,8 +10,8 @@ from . import settings
 
 
 def _now() -> datetime:
-    # ✅ always timezone-aware UTC
     return datetime.now(timezone.utc)
+
 
 
 def _to_aware_utc(ts: Optional[datetime]) -> Optional[datetime]:
@@ -32,10 +32,13 @@ def _case_id() -> str:
 
 
 def _is_stale(ts: Optional[datetime], hours: int = 24) -> bool:
-    ts2 = _to_aware_utc(ts)
-    if not ts2:
+    if not ts:
         return True
-    return (_now() - ts2) > timedelta(hours=hours)
+    # если вдруг в базе оказалось naive время — считаем UTC
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return (_now() - ts) > timedelta(hours=hours)
+
 
 
 def required_slots(case: Dict[str, Any]) -> List[str]:
