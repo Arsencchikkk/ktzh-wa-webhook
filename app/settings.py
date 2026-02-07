@@ -31,10 +31,10 @@ class Settings:
     APP_NAME: str = env_str("APP_NAME", "KTZH Smart Bot")
 
     # Mongo
-    MONGO_URI: str = env_str("MONGO_URI", "mongodb+srv://barsen1506:arsen123@cluster0.ts1nh.mongodb.net/ktzh?retryWrites=true&w=majority")
-    MONGO_DB: str = env_str("MONGO_DB", "ktzh")
-    MONGO_SESSIONS_COLLECTION: str = env_str("MONGO_SESSIONS_COLLECTION", "sessions")
-    MONGO_MESSAGES_COLLECTION: str = env_str("MONGO_MESSAGES_COLLECTION", "messages")
+    MONGODB_URI: str = env_str("MONGO_URI", "mongodb+srv://barsen1506:arsen123@cluster0.ts1nh.mongodb.net/ktzh?retryWrites=true&w=majority")
+    DB_NAME: str = env_str("MONGO_DB", "ktzh")
+    COL_SESSIONS: str = env_str("MONGO_SESSIONS_COLLECTION", "sessions")
+    COL_MESSAGES: str = env_str("MONGO_MESSAGES_COLLECTION", "messages")
 
     # Wazzup
     WAZZUP_API_URL: str = env_str("WAZZUP_API_URL", "https://api.wazzup24.com/v3")
