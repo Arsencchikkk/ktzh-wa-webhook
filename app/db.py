@@ -32,10 +32,8 @@ class MongoStore:
         self.messages = self.db[settings.COL_MESSAGES]
         self.cases = self.db[settings.COL_CASES]
 
-        # ping
         await self.db.command("ping")
 
-        # indexes
         await self.sessions.create_index([("chatIdHash", ASCENDING)], unique=True)
         await self.messages.create_index([("chatIdHash", ASCENDING), ("createdAt", ASCENDING)])
         await self.cases.create_index([("chatIdHash", ASCENDING), ("status", ASCENDING), ("type", ASCENDING)])
@@ -46,28 +44,28 @@ class MongoStore:
             self.client = None
 
     async def get_session(self, chat_id_hash: str) -> Optional[Dict[str, Any]]:
-        doc = await self.sessions.find_one({"chatIdHash": chat_id_hash})
-        return doc
+        return await self.sessions.find_one({"chatIdHash": chat_id_hash})
 
     async def save_session(self, chat_id_hash: str, session: Dict[str, Any]) -> None:
-        session = dict(session)
-        session["chatIdHash"] = chat_id_hash
-        session["updatedAt"] = utcnow().isoformat()
-        session.setdefault("createdAt", utcnow().isoformat())
+        doc = dict(session)
+        doc.pop("_id", None)  # ✅ критично
+        doc["chatIdHash"] = chat_id_hash
+        doc["updatedAt"] = utcnow().isoformat()
+        doc.setdefault("createdAt", utcnow().isoformat())
 
         await self.sessions.update_one(
             {"chatIdHash": chat_id_hash},
-            {"$set": session, "$setOnInsert": {"createdAt": session["createdAt"]}},
+            {"$set": doc, "$setOnInsert": {"createdAt": doc["createdAt"]}},
             upsert=True,
         )
 
     async def add_message(self, doc: Dict[str, Any]) -> None:
-        doc = dict(doc)
-        doc.setdefault("createdAt", utcnow().isoformat())
-        await self.messages.insert_one(doc)
+        d = dict(doc)
+        d.setdefault("createdAt", utcnow().isoformat())
+        await self.messages.insert_one(d)
 
     async def create_case(self, doc: Dict[str, Any]) -> None:
-        doc = dict(doc)
-        doc.setdefault("createdAt", utcnow().isoformat())
-        doc.setdefault("updatedAt", utcnow().isoformat())
-        await self.cases.insert_one(doc)
+        d = dict(doc)
+        d.setdefault("createdAt", utcnow().isoformat())
+        d.setdefault("updatedAt", utcnow().isoformat())
+        await self.cases.insert_one(d)
