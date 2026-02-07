@@ -1,347 +1,380 @@
 from __future__ import annotations
-from typing import Any, Dict, List, Optional
 from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+import time
+import uuid
 
 from .db import MongoStore
-from .nlu import build_nlu, extract_train_and_car, detect_aggression_and_flood, normalize
-
-
-
-CaseType = str  # complaint | lost_and_found | gratitude
+from .settings import settings
+from . import rules
 
 
 @dataclass
 class BotReply:
     text: str
-    asked_slots: List[str]
 
 
-def _ensure_session_defaults(sess: Dict[str, Any]) -> Dict[str, Any]:
-    sess.setdefault("shared", {"train": None, "carNumber": None})
-    sess.setdefault("pending", {"slots": [], "bundle": None, "caseTypes": []})
-    sess.setdefault("cases", {})
-    sess.setdefault("lastBot", {"text": None, "askedSlots": []})
-    sess.setdefault("moderation", {"tone": "neutral", "angry": False, "flooding": False, "repeat_count": 0, "prev_text": None})
-    return sess
-
-
-def _case_defaults(case_type: CaseType) -> Dict[str, Any]:
-    return {
-        "type": case_type,
-        "status": "collecting",
-        "ticketId": None,
-        "slots": {
-            "train": None,
-            "carNumber": None,
-            "complaintText": None,
-            "place": None,
-            "item": None,
-            "itemDetails": None,
-            "when": None,
-            "staffName": None,
-            "gratitudeText": None,
-        }
-    }
-
-
-def _required_slots(case_type: CaseType) -> List[str]:
-    if case_type == "complaint":
-        return ["train", "carNumber", "complaintText"]
-    if case_type == "lost_and_found":
-        return ["train", "carNumber", "place", "item", "when"]
-    if case_type == "gratitude":
-        return ["train", "carNumber", "gratitudeText"]
-    return []
-
-
-def _missing_slots(case: Dict[str, Any]) -> List[str]:
-    req = _required_slots(case["type"])
-    slots = case["slots"]
-    return [k for k in req if not slots.get(k)]
-
-
-def _apply_shared_into_case(shared: Dict[str, Any], case: Dict[str, Any]) -> None:
-    if shared.get("train") and not case["slots"].get("train"):
-        case["slots"]["train"] = shared["train"]
-    if shared.get("carNumber") and not case["slots"].get("carNumber"):
-        case["slots"]["carNumber"] = shared["carNumber"]
-
-
-def _set_shared(shared: Dict[str, Any], train: Optional[str], car: Optional[int]) -> None:
-    if train:
-        shared["train"] = train
-    if car:
-        shared["carNumber"] = car
-
-
-def _parse_lost_bundle(text: str) -> Dict[str, Optional[str]]:
-    t = normalize(text)
-    place = None
-    for key in ["место", "купе", "тамбур", "полка", "у окна", "у двери", "багаж", "верхняя", "нижняя"]:
-        if key in t:
-            place = text.strip()
-            break
-
-    item = None
-    for key in ["сумк", "рюкзак", "кошел", "телефон", "документ", "паспорт", "карта", "чемодан", "ноутбук", "пакет"]:
-        if key in t:
-            item = text.strip()
-            break
-
-    when = None
-    for key in ["сегодня", "вчера", "позавчера", "утром", "вечером", "ночью", "только что"]:
-        if key in t:
-            when = text.strip()
-            break
-
-    import re
-    if not when and (re.search(r"\b\d{1,2}[:.]\d{2}\b", text) or re.search(r"\b\d{1,2}\s*(час|ч)\b", t)):
-        when = text.strip()
-
-    return {"place": place, "item": item, "when": when}
+def new_ticket_id(prefix: str) -> str:
+    # KTZH-YYYYMMDD-XXXX
+    ts = time.strftime("%Y%m%d", time.gmtime())
+    rnd = uuid.uuid4().hex[:8].upper()
+    return f"KTZH-{prefix}-{ts}-{rnd}"
 
 
 class DialogManager:
-    def __init__(self, store: MongoStore) -> None:
+    def __init__(self, store: MongoStore):
         self.store = store
 
-    def handle(self, chat_id_hash: str, chat_meta: Dict[str, Any], user_text: str) -> BotReply:
-        sess = _ensure_session_defaults(self.store.get_session(chat_id_hash) or {})
-        pending_slots: List[str] = sess["pending"].get("slots", [])
+    async def handle(self, chat_id_hash: str, chat_meta: Dict[str, Any], user_text: str) -> BotReply:
+        user_text = (user_text or "").strip()
+        now = time.time()
 
-        # --- moderation update (anti-flood / aggression) ---
-        mod = detect_aggression_and_flood(
-            user_text,
-            prev_text=sess["moderation"].get("prev_text"),
-            repeat_count=int(sess["moderation"].get("repeat_count") or 0),
+        session = await self.store.get_session(chat_id_hash)
+        if not session:
+            session = self._new_session(chat_meta)
+
+        session.setdefault("history", [])
+        session.setdefault("shared", {"train": None, "car": None})
+        session.setdefault("cases", [])
+        session.setdefault("pending", None)
+        session.setdefault("aggression", 0)
+        session.setdefault("flood", {"window_start": now, "count": 0})
+
+        # log user message
+        await self.store.log_message(chat_id_hash, "user", user_text, {"chat": chat_meta})
+        self._push_history(session, "user", user_text)
+
+        # flood / aggression
+        session["aggression"] = max(0, int(session.get("aggression", 0)) - 1)  # легкий decay
+        session["aggression"] += rules.detect_aggression(user_text)
+
+        self._update_flood(session, now)
+        is_flood = session["flood"]["count"] >= settings.FLOOD_MAX_MSG
+        is_angry = session["aggression"] >= 2
+
+        # 0) greeting-only — не создаём кейс
+        if rules.is_greeting_only(user_text):
+            reply = "Здравствуйте! Напишите, пожалуйста, что случилось: опоздание, забытая вещь или благодарность."
+            await self._save(session, chat_id_hash, reply, chat_meta)
+            return BotReply(reply)
+
+        # 1) Если pending-slot активен — сначала пытаемся заполнить его коротким ответом
+        pending = session.get("pending")
+        if pending:
+            filled = self._apply_pending(session, user_text)
+            if filled:
+                # после заполнения — продолжаем диалог по кейсам
+                reply = await self._continue_after_update(session, chat_id_hash, chat_meta, is_angry=is_angry, is_flood=is_flood)
+                return BotReply(reply)
+
+        # 2) смысл есть/нет
+        sc = rules.meaning_score(user_text)
+        if sc < settings.MEANING_MIN_SCORE:
+            # если нет pending и смысла мало — мягко попросим уточнить
+            reply = "Понял. Опишите, пожалуйста, проблему одним сообщением (например: 'поезд T58, вагон 7, оставил сумку')."
+            if is_angry or is_flood:
+                reply = "Напишите: номер поезда и вагон, и что случилось."
+            await self._save(session, chat_id_hash, reply, chat_meta)
+            return BotReply(reply)
+
+        # 3) cancel / нашлась вещь / отмена
+        if rules.detect_cancel(user_text):
+            closed_any = self._close_open_cases(session, reason="cancel_by_user")
+            if closed_any:
+                reply = "Принято. Я закрыл(а) ваши активные заявки. Если нужно — опишите новую проблему."
+                if is_angry or is_flood:
+                    reply = "Ок. Закрыл(а) заявки."
+                await self._save(session, chat_id_hash, reply, chat_meta)
+                return BotReply(reply)
+
+        # 4) детект intents + слоты
+        intents = rules.detect_intents(user_text)
+        slots = rules.extract_slots(user_text)
+        self._merge_shared(session, slots)
+
+        # 5) если intents пустой — считаем как общую "жалобу/сообщение" и уточняем
+        if not intents:
+            reply = await self._ask_primary_intent(session, chat_id_hash, chat_meta, is_angry=is_angry, is_flood=is_flood)
+            return BotReply(reply)
+
+        # 6) создаём кейсы (мульти)
+        for it in intents:
+            self._ensure_case(session, it)
+
+        # 7) кейс-специфичные поля из текста
+        self._apply_case_text(session, intents, user_text)
+
+        # 8) продолжаем: задаём следующий лучший вопрос / или создаём заявки
+        reply = await self._continue_after_update(session, chat_id_hash, chat_meta, is_angry=is_angry, is_flood=is_flood)
+        return BotReply(reply)
+
+    # ---------------- internal helpers ----------------
+
+    def _new_session(self, chat_meta: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "version": 1,
+            "chat": {
+                "chatId": chat_meta.get("chatId"),
+                "channelId": chat_meta.get("channelId"),
+                "chatType": chat_meta.get("chatType"),
+            },
+            "history": [],
+            "shared": {"train": None, "car": None},
+            "cases": [],
+            "pending": None,
+            "aggression": 0,
+            "flood": {"window_start": time.time(), "count": 0},
+        }
+
+    def _push_history(self, session: Dict[str, Any], role: str, text: str) -> None:
+        h = session["history"]
+        h.append({"role": role, "text": text, "ts": time.time()})
+        if len(h) > settings.MAX_HISTORY:
+            del h[:-settings.MAX_HISTORY]
+
+    def _update_flood(self, session: Dict[str, Any], now: float) -> None:
+        fw = session.get("flood") or {"window_start": now, "count": 0}
+        ws = float(fw.get("window_start", now))
+        if now - ws > settings.FLOOD_WINDOW_SEC:
+            fw["window_start"] = now
+            fw["count"] = 0
+        fw["count"] = int(fw.get("count", 0)) + 1
+        session["flood"] = fw
+
+    def _merge_shared(self, session: Dict[str, Any], slots: Dict[str, object]) -> None:
+        shared = session["shared"]
+        if "train" in slots and slots["train"]:
+            shared["train"] = slots["train"]
+        if "car" in slots and slots["car"]:
+            shared["car"] = slots["car"]
+
+    def _ensure_case(self, session: Dict[str, Any], case_type: str) -> None:
+        for c in session["cases"]:
+            if c["type"] == case_type and c["status"] in ("draft", "open"):
+                return
+        session["cases"].append(
+            {
+                "id": uuid.uuid4().hex,
+                "type": case_type,  # complaint|lost|gratitude
+                "status": "draft",  # draft -> open -> closed
+                "ticket_id": None,
+                "slots": {},
+                "created_at": time.time(),
+                "updated_at": time.time(),
+            }
         )
-        sess["moderation"].update(mod)
 
-        nlu = build_nlu(user_text, pending_slots)
+    def _apply_case_text(self, session: Dict[str, Any], intents: List[str], user_text: str) -> None:
+        t = user_text.strip()
+        for c in session["cases"]:
+            if c["type"] not in intents:
+                continue
+            s = c["slots"]
+            if c["type"] == "complaint":
+                # complaint_text если это не просто "жалоба" одним словом
+                if len(t) >= 6:
+                    s.setdefault("complaint_text", t)
+            elif c["type"] == "lost":
+                if len(t) >= 6:
+                    s.setdefault("item_text", t)
+            elif c["type"] == "gratitude":
+                if len(t) >= 4:
+                    s.setdefault("gratitude_text", t)
+            c["updated_at"] = time.time()
 
-        # store inbound message
-        self.store.add_message({
-            "chatIdHash": chat_id_hash,
-            "chatId": chat_meta.get("chatId"),
-            "channelId": chat_meta.get("channelId"),
-            "chatType": chat_meta.get("chatType"),
-            "direction": "inbound",
-            "text": user_text,
-            "dateTime": chat_meta.get("dateTime"),
-            "raw": chat_meta.get("raw"),
-        })
-
-        # --- auto close: cancel/found ---
-        if nlu.isCancel or nlu.isFound:
-            if nlu.isCancel:
-                closed = self.store.close_open_cases(chat_id_hash, None)
-                # also clear local session cases
-                sess["cases"] = {}
-                sess["pending"] = {"slots": [], "bundle": None, "caseTypes": []}
-                txt = "Ок, отменил(а) заявки." if closed > 0 else "Ок, понял(а)."
-                if sess["moderation"].get("angry"):
-                    txt = "Ок. Закрыл(а)." if closed > 0 else "Ок."
-                self._persist(sess, chat_id_hash, chat_meta, txt, [])
-                return BotReply(txt, [])
-
-            # found
-            closed = self.store.close_open_cases(chat_id_hash, "lost_and_found")
-            if "lost_and_found" in sess["cases"]:
-                sess["cases"].pop("lost_and_found", None)
-            sess["pending"] = {"slots": [], "bundle": None, "caseTypes": []}
-            txt = "Отлично! Закрыл(а) заявку по забытым вещам." if closed > 0 else "Отлично! Тогда заявку по забытым вещам не создаю."
-            if sess["moderation"].get("angry"):
-                txt = "Ок. Закрыл(а) по вещам." if closed > 0 else "Ок."
-            self._persist(sess, chat_id_hash, chat_meta, txt, [])
-            return BotReply(txt, [])
-
-        # reset
-        if nlu.isReset:
-            self.store.reset_session(chat_id_hash)
-            return BotReply("Ок, сбросил диалог. Напишите: жалоба / потерял вещь / благодарность.", [])
-
-        # greeting only (no case)
-        if nlu.isGreetingOnly:
-            txt = "Здравствуйте! Напишите: жалоба / потерял вещь / благодарность."
-            if sess["moderation"].get("angry"):
-                txt = "Напишите: жалоба / потерял / благодарность."
-            self._persist(sess, chat_id_hash, chat_meta, txt, [])
-            return BotReply(txt, [])
-
-        # low meaning and no pending => clarify (но без спора)
-        if nlu.meaningScore_0_100 < 30 and not pending_slots:
-            txt = "Не понял. Напишите: жалоба / потерял вещь / благодарность."
-            if sess["moderation"].get("angry"):
-                txt = "Коротко: жалоба / потерял / благодарность."
-            self._persist(sess, chat_id_hash, chat_meta, txt, [])
-            return BotReply(txt, [])
-
-        # pending slots fill
-        if pending_slots:
-            if self._try_fill_pending(sess, user_text):
-                pass
-
-        # update shared from msg
-        train, car = extract_train_and_car(user_text)
-        _set_shared(sess["shared"], train, car)
-
-        # activate cases by intents (multi-intent)
-        for it in nlu.intents:
-            if it not in sess["cases"]:
-                sess["cases"][it] = _case_defaults(it)
-
-        # attach texts
-        if "complaint" in sess["cases"] and nlu.complaintText:
-            sess["cases"]["complaint"]["slots"]["complaintText"] = user_text.strip()
-        if "gratitude" in sess["cases"] and nlu.gratitudeText:
-            sess["cases"]["gratitude"]["slots"]["gratitudeText"] = user_text.strip()
-        if "lost_and_found" in sess["cases"] and nlu.lostHint:
-            if len(nlu.lostHint.strip()) >= 10 and not sess["cases"]["lost_and_found"]["slots"].get("itemDetails"):
-                sess["cases"]["lost_and_found"]["slots"]["itemDetails"] = nlu.lostHint.strip()
-
-        # apply shared
-        for case in sess["cases"].values():
-            _apply_shared_into_case(sess["shared"], case)
-
-        reply = self._next_step(chat_id_hash, sess)
-
-        self._persist(sess, chat_id_hash, chat_meta, reply.text, reply.asked_slots)
-        return reply
-
-    def _persist(self, sess: Dict[str, Any], chat_id_hash: str, chat_meta: Dict[str, Any], txt: str, asked: List[str]) -> None:
-        sess["chatId"] = chat_meta.get("chatId")
-        sess["channelId"] = chat_meta.get("channelId")
-        sess["chatType"] = chat_meta.get("chatType")
-        sess["lastBot"] = {"text": txt, "askedSlots": asked}
-        self.store.upsert_session(chat_id_hash, sess)
-
-    def _try_fill_pending(self, sess: Dict[str, Any], user_text: str) -> bool:
-        slots_to_fill: List[str] = sess["pending"].get("slots", [])
-        if not slots_to_fill:
+    def _apply_pending(self, session: Dict[str, Any], user_text: str) -> bool:
+        """
+        pending = {
+          "slots": ["train","car"] or ["car"] ...
+          "scope": "shared" | "case:<id>"
+        }
+        """
+        pending = session.get("pending")
+        if not pending or not isinstance(pending, dict):
             return False
 
-        text = user_text.strip()
+        needed: List[str] = list(pending.get("slots") or [])
+        if not needed:
+            session["pending"] = None
+            return False
+
+        filled_any = False
+        text = user_text
+
+        # пытаемся вытянуть train/car/place по очереди
+        if "train" in needed:
+            tr = rules.parse_train(text)
+            if not tr:
+                # если ожидаем поезд и клиент пишет просто "58"
+                num = rules.parse_short_number(text)
+                if num and 1 <= num <= 9999:
+                    tr = f"T{num}"
+            if tr:
+                session["shared"]["train"] = tr
+                needed.remove("train")
+                filled_any = True
+
+        if "car" in needed:
+            car = rules.parse_car(text)
+            if car is None:
+                # если ожидаем вагон — короткая цифра ок
+                num = rules.parse_short_number(text)
+                if num and 1 <= num <= 99:
+                    car = num
+            if car is not None:
+                session["shared"]["car"] = car
+                needed.remove("car")
+                filled_any = True
+
+        # case-specific pending (lost: place)
+        if "place" in needed:
+            pl = rules.parse_place(text)
+            if pl:
+                # scope может быть case:<id>
+                scope = pending.get("scope", "")
+                if scope.startswith("case:"):
+                    cid = scope.split(":", 1)[1]
+                    for c in session["cases"]:
+                        if c["id"] == cid:
+                            c["slots"]["place"] = pl
+                            break
+                needed.remove("place")
+                filled_any = True
+
+        pending["slots"] = needed
+        if not needed:
+            session["pending"] = None
+        else:
+            session["pending"] = pending
+
+        return filled_any
+
+    def _close_open_cases(self, session: Dict[str, Any], reason: str) -> bool:
         changed = False
-
-        train, car = extract_train_and_car(text)
-        if "train" in slots_to_fill and train and not sess["shared"].get("train"):
-            sess["shared"]["train"] = train
-            changed = True
-        if "carNumber" in slots_to_fill and car and not sess["shared"].get("carNumber"):
-            sess["shared"]["carNumber"] = car
-            changed = True
-
-        case_types: List[str] = sess["pending"].get("caseTypes", [])
-        bundle = sess["pending"].get("bundle")
-
-        def set_for_cases(key: str, value: Any) -> None:
-            nonlocal changed
-            for ct in case_types:
-                if ct in sess["cases"]:
-                    if not sess["cases"][ct]["slots"].get(key) and value:
-                        sess["cases"][ct]["slots"][key] = value
-                        changed = True
-
-        if bundle == "lost_bundle":
-            parsed = _parse_lost_bundle(text)
-            if "place" in slots_to_fill and parsed["place"]:
-                set_for_cases("place", parsed["place"])
-            if "item" in slots_to_fill and parsed["item"]:
-                set_for_cases("item", parsed["item"])
-            if "when" in slots_to_fill and parsed["when"]:
-                set_for_cases("when", parsed["when"])
-            if len(text) >= 10:
-                set_for_cases("itemDetails", text)
-
-        if bundle == "complaint_text":
-            if "complaintText" in slots_to_fill and len(text) >= 5:
-                set_for_cases("complaintText", text)
-
-        if bundle == "gratitude_bundle":
-            if "gratitudeText" in slots_to_fill and len(text) >= 5:
-                set_for_cases("gratitudeText", text)
-
-        if changed:
-            sess["pending"] = {"slots": [], "bundle": None, "caseTypes": []}
+        for c in session["cases"]:
+            if c["status"] in ("draft", "open"):
+                c["status"] = "closed"
+                c["closed_reason"] = reason
+                c["updated_at"] = time.time()
+                changed = True
         return changed
 
-    def _next_step(self, chat_id_hash: str, sess: Dict[str, Any]) -> BotReply:
-        angry = bool(sess["moderation"].get("angry"))
+    async def _ask_primary_intent(self, session: Dict[str, Any], chat_id_hash: str, chat_meta: Dict[str, Any],
+                                 is_angry: bool, is_flood: bool) -> str:
+        reply = "Уточните, пожалуйста, что именно нужно: жалоба, забытая вещь или благодарность?"
+        if is_angry or is_flood:
+            reply = "Что именно: жалоба / забытая вещь / благодарность?"
+        await self._save(session, chat_id_hash, reply, chat_meta)
+        return reply
 
-        if not sess["cases"]:
-            txt = "Это жалоба, потеря вещи или благодарность?"
-            if angry:
-                txt = "Жалоба / потерял / благодарность?"
-            return BotReply(txt, [])
+    def _required_slots_for_case(self, case_type: str) -> List[str]:
+        # shared: train, car
+        if case_type == "complaint":
+            return ["train", "car", "complaint_text"]
+        if case_type == "lost":
+            # в lost обязательно ещё место+описание
+            return ["train", "car", "place", "item_text"]
+        if case_type == "gratitude":
+            # благодарность — не закрывать сразу: спрашиваем кого + за что + поезд/вагон
+            return ["train", "car", "gratitude_text"]
+        return ["train", "car"]
 
-        needs_train = any("train" in _missing_slots(case) for case in sess["cases"].values())
-        needs_car = any("carNumber" in _missing_slots(case) for case in sess["cases"].values())
-        if needs_train or needs_car:
-            sess["pending"] = {"slots": ["train", "carNumber"], "bundle": "train_car", "caseTypes": list(sess["cases"].keys())}
-            txt = "Укажите поезд и вагон. Пример: Т58, 7."
-            if not angry:
-                txt = "Уточните номер поезда и номер вагона (можно одним сообщением). Пример: Т58, 7 вагон"
-            return BotReply(txt, ["train", "carNumber"])
+    def _case_missing(self, session: Dict[str, Any], case: Dict[str, Any]) -> List[str]:
+        shared = session["shared"]
+        slots = case["slots"]
+        missing: List[str] = []
+        for rs in self._required_slots_for_case(case["type"]):
+            if rs in ("train", "car"):
+                if not shared.get(rs):
+                    missing.append(rs)
+            else:
+                if not slots.get(rs):
+                    missing.append(rs)
+        return missing
 
-        # priority: lost -> complaint -> gratitude
-        for ct in ["lost_and_found", "complaint", "gratitude"]:
-            if ct not in sess["cases"]:
-                continue
-            case = sess["cases"][ct]
-            miss = _missing_slots(case)
-            if not miss:
-                continue
+    def _next_question_for_missing(self, case_type: str, missing: List[str], is_angry: bool) -> str:
+        # bundle train+car вместе
+        if "train" in missing or "car" in missing:
+            if is_angry:
+                return "Напишите номер поезда и вагон (например: T58, вагон 7)."
+            return "Уточните номер поезда и номер вагона (можно одним сообщением, например: T58, вагон 7)."
 
-            if ct == "lost_and_found":
-                sess["pending"] = {"slots": ["place", "item", "when"], "bundle": "lost_bundle", "caseTypes": ["lost_and_found"]}
-                txt = "Где? Что за вещь? Когда?"
-                if not angry:
-                    txt = (
-                        "Напишите одним сообщением:\n"
-                        "1) где в вагоне (место/купе/полка/тамбур)\n"
-                        "2) что за вещь и приметы\n"
-                        "3) когда (сегодня/вчера/время)"
-                    )
-                return BotReply(txt, ["place", "item", "when"])
+        if case_type == "complaint":
+            if "complaint_text" in missing:
+                return "Опишите, пожалуйста, что произошло (например: 'поезд задержался на 1 час')."
 
-            if ct == "complaint":
-                sess["pending"] = {"slots": ["complaintText"], "bundle": "complaint_text", "caseTypes": ["complaint"]}
-                txt = "Что произошло? (коротко)"
-                if not angry:
-                    txt = "Опишите, пожалуйста, суть жалобы (что произошло)."
-                return BotReply(txt, ["complaintText"])
+        if case_type == "lost":
+            # bundle по lost
+            if "place" in missing and "item_text" in missing:
+                return "Где примерно в вагоне оставили и что это за вещь? (место/купе/полка + описание)."
+            if "place" in missing:
+                return "Уточните место в вагоне (место/купе/полка/тамбур)."
+            if "item_text" in missing:
+                return "Опишите, пожалуйста, вещь (что именно, цвет, приметы)."
 
-            if ct == "gratitude":
-                # не закрываем — тянем детали
-                sess["pending"] = {"slots": ["gratitudeText"], "bundle": "gratitude_bundle", "caseTypes": ["gratitude"]}
-                txt = "Кого благодарите и за что?"
-                if not angry:
-                    txt = "Принял(а) благодарность 🙌 Кого вы хотите поблагодарить и за что? (можно одним сообщением)"
-                return BotReply(txt, ["gratitudeText"])
+        if case_type == "gratitude":
+            if "gratitude_text" in missing:
+                return "Кого хотите поблагодарить и за что? (например: 'проводника, помог с багажом')."
 
-        # create tickets when ready
-        created = []
-        for ct, case in sess["cases"].items():
-            if _missing_slots(case):
-                continue
-            if case.get("ticketId"):
-                continue
-            payload = {"type": ct, "shared": sess["shared"], "slots": case["slots"]}
-            ticket_id = self.store.create_case(chat_id_hash, ct, payload)
-            case["ticketId"] = ticket_id
-            case["status"] = "done"
-            created.append((ct, ticket_id))
+        return "Уточните, пожалуйста, детали."
 
-        if created:
-            sess["pending"] = {"slots": [], "bundle": None, "caseTypes": []}
-            if angry:
-                # максимально коротко
-                lines = [f"{tid}" for _, tid in created]
-                return BotReply("Принял(а). Заявки: " + ", ".join(lines), [])
-            parts = []
-            for ct, tid in created:
-                label = "Жалоба" if ct == "complaint" else ("Забытые вещи" if ct == "lost_and_found" else "Благодарность")
-                parts.append(f"{label}: {tid}")
-            return BotReply("Принял(а).\n" + "\n".join(parts), [])
+    async def _continue_after_update(self, session: Dict[str, Any], chat_id_hash: str, chat_meta: Dict[str, Any],
+                                    is_angry: bool, is_flood: bool) -> str:
+        # 1) если есть draft/open кейсы — выбираем тот, где больше всего не хватает
+        draft_cases = [c for c in session["cases"] if c["status"] in ("draft", "open")]
+        if not draft_cases:
+            reply = "Понял(а). Чем ещё могу помочь?"
+            if is_angry or is_flood:
+                reply = "Ок. Что ещё?"
+            await self._save(session, chat_id_hash, reply, chat_meta)
+            return reply
 
-        return BotReply("Принял(а).", [])
+        # приоритет: lost -> complaint -> gratitude (чтобы быстрее спасать вещи)
+        priority = {"lost": 0, "complaint": 1, "gratitude": 2}
+        draft_cases.sort(key=lambda c: (priority.get(c["type"], 9), len(self._case_missing(session, c))))
+
+        # 2) если есть кейс полностью заполненный — “создаём заявку” (ticket_id)
+        for c in draft_cases:
+            missing = self._case_missing(session, c)
+            if not missing and not c.get("ticket_id"):
+                prefix = {"complaint": "CMP", "lost": "LAF", "gratitude": "THX"}.get(c["type"], "GEN")
+                c["ticket_id"] = new_ticket_id(prefix)
+                c["status"] = "open"
+                c["updated_at"] = time.time()
+
+        # 3) если после создания tickets осталось что-то спрашивать — задаём ОДИН лучший вопрос
+        for c in draft_cases:
+            missing = self._case_missing(session, c)
+            if missing:
+                # если missing train/car — ставим pending shared bundle
+                if "train" in missing or "car" in missing:
+                    session["pending"] = {"slots": ["train", "car"], "scope": "shared"}
+                else:
+                    # case-specific pending (например place)
+                    if "place" in missing:
+                        session["pending"] = {"slots": ["place"], "scope": f"case:{c['id']}"}
+
+                reply = self._next_question_for_missing(c["type"], missing, is_angry=is_angry or is_flood)
+                await self._save(session, chat_id_hash, reply, chat_meta)
+                return reply
+
+        # 4) если всё открыто — подтверждаем пользователю список заявок
+        opened = [c for c in session["cases"] if c["status"] == "open" and c.get("ticket_id")]
+        if opened:
+            ids = ", ".join(c["ticket_id"] for c in opened)
+            reply = f"Принял(а). Ваши заявки зарегистрированы: {ids}."
+            if is_angry or is_flood:
+                reply = f"Ок. Заявки: {ids}."
+            await self._save(session, chat_id_hash, reply, chat_meta)
+            return reply
+
+        reply = "Понял(а). Уточните, пожалуйста, детали."
+        if is_angry or is_flood:
+            reply = "Уточните детали."
+        await self._save(session, chat_id_hash, reply, chat_meta)
+        return reply
+
+    async def _save(self, session: Dict[str, Any], chat_id_hash: str, bot_text: str, chat_meta: Dict[str, Any]) -> None:
+        await self.store.log_message(chat_id_hash, "bot", bot_text, {"chat": chat_meta})
+        self._push_history(session, "bot", bot_text)
+        await self.store.save_session(chat_id_hash, session)
