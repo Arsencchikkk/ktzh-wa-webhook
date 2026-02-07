@@ -148,17 +148,18 @@ async def process_items(items: List[Dict[str, Any]]) -> Dict[str, Any]:
         logger.info("IN: chatId=%s text=%r", chat_id, msg["text"])
 
         try:
-            bot_reply = await dialog.handle(
-                chat_id_hash=chat_id_hash,
-                chat_meta={
-                    "chatId": msg["chatId"],
-                    "channelId": msg["channelId"],
-                    "chatType": msg["chatType"],
-                    "dateTime": msg["dateTime"],
-                    "raw": msg["raw"],
-                },
-                user_text=msg["text"],
-            )
+            bot_reply = dialog.handle(
+    chat_id_hash=chat_id_hash,
+    chat_meta={
+        "chatId": msg["chatId"],
+        "channelId": msg["channelId"],
+        "chatType": msg["chatType"],
+        "dateTime": msg["dateTime"],
+        "raw": msg["raw"],
+    },
+    user_text=msg["text"],
+)
+
         except Exception as e:
             logger.exception("Dialog error: %s", e)
             continue
