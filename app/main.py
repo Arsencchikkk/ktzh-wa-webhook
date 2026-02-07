@@ -30,7 +30,9 @@ async def startup():
 @app.on_event("shutdown")
 async def shutdown():
     await store.close()
-    await wazzup.close()
+    # если у тебя нет close() в WazzupClient — просто удали следующую строку
+    if hasattr(wazzup, "close"):
+        await wazzup.close()
 
 
 def chat_hash(chat_id: str) -> str:
@@ -39,23 +41,15 @@ def chat_hash(chat_id: str) -> str:
 
 
 def extract_inbound(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    # statuses callbacks
     if "statuses" in payload:
         return None
-
-    # echo from our bot
     if payload.get("isEcho") is True:
         return None
-
-    # if direction exists and not inbound
     direction = payload.get("direction")
     if direction and direction != "inbound":
         return None
 
-    # ✅ Wazzup часто кладёт text прямо в корень
     text = payload.get("text")
-
-    # fallback legacy formats
     if not text:
         raw = payload.get("raw") or {}
         if isinstance(raw, dict):
@@ -107,16 +101,19 @@ async def process_items(items: list) -> None:
         chat_id_hash = chat_hash(msg["chatId"])
         log.info("IN: chatId=%s text=%r", msg["chatId"], msg["text"])
 
-        # ✅ пишем входящее в Mongo
-        await store.add_message({
-            "dir": "in",
-            "chatIdHash": chat_id_hash,
-            "chatId": msg["chatId"],
-            "channelId": msg["channelId"],
-            "chatType": msg["chatType"],
-            "text": msg["text"],
-            "raw": msg["raw"],
-        })
+        # входящее в Mongo
+        try:
+            await store.add_message({
+                "dir": "in",
+                "chatIdHash": chat_id_hash,
+                "chatId": msg["chatId"],
+                "channelId": msg["channelId"],
+                "chatType": msg["chatType"],
+                "text": msg["text"],
+                "raw": msg["raw"],
+            })
+        except Exception:
+            log.exception("Mongo add_message(in) failed")
 
         try:
             bot_reply = await dialog.handle(
@@ -145,16 +142,18 @@ async def process_items(items: list) -> None:
             )
             log.info("SENT: %s", send_res)
 
-            # ✅ пишем исходящее в Mongo
-            await store.add_message({
-                "dir": "out",
-                "chatIdHash": chat_id_hash,
-                "chatId": msg["chatId"],
-                "channelId": msg["channelId"],
-                "chatType": msg["chatType"],
-                "text": bot_reply.text,
-                "send": send_res,
-            })
+            try:
+                await store.add_message({
+                    "dir": "out",
+                    "chatIdHash": chat_id_hash,
+                    "chatId": msg["chatId"],
+                    "channelId": msg["channelId"],
+                    "chatType": msg["chatType"],
+                    "text": bot_reply.text,
+                    "send": send_res,
+                })
+            except Exception:
+                log.exception("Mongo add_message(out) failed")
 
 
 @app.post("/webhooks")
@@ -169,6 +168,5 @@ async def wazzup_webhook(request: Request, background: BackgroundTasks):
     payload = await request.json()
     items = payload if isinstance(payload, list) else [payload]
 
-    # ✅ async background ok
     background.add_task(process_items, items)
     return JSONResponse({"ok": True, "queued": len(items)})
