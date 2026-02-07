@@ -177,7 +177,6 @@ async def process_payload(payload: Dict[str, Any]):
         doc_insert = {"messageId": message_id, "createdAt": dt or datetime.utcnow()}
 
         doc_set = {
-            "messageId": message_id,
             "channelId": channel_id,
             "chatId": chat_id,
             "chatIdHash": _hash_phone(chat_id),
