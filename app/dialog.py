@@ -121,39 +121,65 @@ def _case_title(case_type: str) -> str:
 
 
 class DialogManager:
-    """
-    Универсальный rule-based менеджер диалога:
-    - shared slots: train/car
-    - multi-intent -> несколько кейсов
-    - pending-slot -> короткие ответы трактуем правильно
-    """
-
     def __init__(self, store: Any):
         self.store = store
         self.nlu = build_nlu()
 
-    # ---- storage helpers ----
-
-    def _load_session(self, chat_id_hash: str) -> Dict[str, Any]:
+    async def _load_session(self, chat_id_hash: str) -> Dict[str, Any]:
         s = None
         if hasattr(self.store, "get_session"):
-            s = self.store.get_session(chat_id_hash)
+            s = await self.store.get_session(chat_id_hash)
         if not s:
             s = {
                 "shared": {"train": None, "car": None},
-                "cases": [],          # list[dict]
-                "pending": None,      # dict with expected slots
-                "aggression": 0,
-                "flood": None,
+                "cases": [],
+                "pending": None,
+                "moderation": {"prev_text": None, "repeat_count": 0, "last_ts": 0.0},
                 "createdAt": _now_utc().isoformat(),
                 "updatedAt": _now_utc().isoformat(),
             }
         return s
 
-    def _save_session(self, chat_id_hash: str, session: Dict[str, Any]) -> None:
+    async def _save_session(self, chat_id_hash: str, session: Dict[str, Any]) -> None:
         session["updatedAt"] = _now_utc().isoformat()
         if hasattr(self.store, "save_session"):
-            self.store.save_session(chat_id_hash, session)
+            await self.store.save_session(chat_id_hash, session)
+
+    async def _submit_case(self, chat_id_hash: str, session: Dict[str, Any], case: Dict[str, Any]) -> str:
+        case_id = _gen_case_id("KTZH", chat_id_hash)
+        case["caseId"] = case_id
+        case["status"] = "open"
+        case["openedAt"] = _now_utc().isoformat()
+
+        # ✅ пишем в Mongo cases
+        if hasattr(self.store, "create_case"):
+            await self.store.create_case({
+                "ticketId": case_id,
+                "chatIdHash": chat_id_hash,
+                "type": case["type"],
+                "status": "open",
+                "payload": {
+                    "shared": session.get("shared"),
+                    "slots": case.get("slots"),
+                },
+            })
+
+        return case_id
+
+    async def handle(self, chat_id_hash: str, chat_meta: Dict[str, Any], user_text: str) -> BotReply:
+        session = await self._load_session(chat_id_hash)
+        _, is_angry, is_flood = detect_aggression_and_flood(session, user_text)
+        nlu_res = self.nlu.analyze(user_text or "")
+
+        if nlu_res.cancel:
+            self._close_all_cases(session, reason="user_cancel")
+            await self._save_session(chat_id_hash, session)
+            return BotReply(text="Ок, остановил. Если нужно — напишите снова.")
+
+        # ... ДАЛЬШЕ ТВОЯ ЛОГИКА ПОЧТИ БЕЗ ИЗМЕНЕНИЙ ...
+        # только все self._save_session(...) -> await self._save_session(...)
+        # и self._submit_case(...) -> await self._submit_case(...)
+
 
     # ---- case helpers ----
 
