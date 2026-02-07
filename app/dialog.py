@@ -1,35 +1,45 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, Optional, List
-
-from zoneinfo import ZoneInfo
 
 from .nlu import run_nlu
 from .routing import resolve_region, resolve_executor
 from . import settings
 
-TZ = ZoneInfo("Asia/Almaty")
 
 def _now() -> datetime:
-    return datetime.now(TZ)
+    # ✅ always timezone-aware UTC
+    return datetime.now(timezone.utc)
+
+
+def _to_aware_utc(ts: Optional[datetime]) -> Optional[datetime]:
+    if ts is None:
+        return None
+    if ts.tzinfo is None:
+        # naive -> assume UTC
+        return ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(timezone.utc)
+
 
 def _compact(d: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in d.items() if v is not None and v != "" and v != [] and v != {}}
 
+
 def _case_id() -> str:
-    # human-readable id
     return f"KTZH-{_now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:8].upper()}"
 
+
 def _is_stale(ts: Optional[datetime], hours: int = 24) -> bool:
-    if not ts:
+    ts2 = _to_aware_utc(ts)
+    if not ts2:
         return True
-    return (_now() - ts) > timedelta(hours=hours)
+    return (_now() - ts2) > timedelta(hours=hours)
+
 
 def required_slots(case: Dict[str, Any]) -> List[str]:
     ctype = case.get("caseType")
-
     extracted = case.get("extracted", {})
     cats = set(case.get("categories", []))
 
@@ -42,7 +52,6 @@ def required_slots(case: Dict[str, Any]) -> List[str]:
         if wagon_needed and not extracted.get("wagon"):
             need.append("wagon")
 
-        # for delays, date/time is more important than wagon
         if "опоздание" in cats:
             if not extracted.get("date") and not extracted.get("time"):
                 need.append("date_or_time")
@@ -55,21 +64,17 @@ def required_slots(case: Dict[str, Any]) -> List[str]:
             need.append("item")
         if not extracted.get("train") and not (extracted.get("routeFrom") and extracted.get("routeTo")):
             need.append("train_or_route")
-        # at least one of wagon or date/time to make it actionable
         if not extracted.get("wagon") and not extracted.get("date") and not extracted.get("time"):
             need.append("wagon_or_time")
         return need
 
-    if ctype in ("gratitude", "info", "other"):
-        return []
-
     return []
+
 
 def build_question(case: Dict[str, Any], missing: List[str]) -> Optional[str]:
     if not missing:
         return None
 
-    # Ask at most “one message” (may include two fields)
     if missing[0] == "train_or_route":
         if "wagon" in missing:
             return "Уточните, пожалуйста, номер поезда и вагон (пример: Т58, вагон 3)."
@@ -88,6 +93,7 @@ def build_question(case: Dict[str, Any], missing: List[str]) -> Optional[str]:
         return "Уточните, пожалуйста, номер вагона или время/дату, когда оставили вещь (как минимум одно)."
 
     return "Уточните, пожалуйста, детали обращения."
+
 
 def format_dispatch_text(case: Dict[str, Any]) -> str:
     ex = case.get("extracted", {})
@@ -116,7 +122,6 @@ def format_dispatch_text(case: Dict[str, Any]) -> str:
     else:
         parts.append(f"Текст: {case.get('lastText','')}".strip())
 
-    # attachments
     att = case.get("attachments", [])
     if att:
         parts.append("Вложения:")
@@ -124,6 +129,7 @@ def format_dispatch_text(case: Dict[str, Any]) -> str:
             parts.append(f"- {a.get('type')}: {a.get('contentUri') or a.get('text') or ''}".strip())
 
     return "\n".join([p for p in parts if p])
+
 
 def format_user_ack(case: Dict[str, Any]) -> str:
     if case.get("caseType") == "gratitude":
@@ -135,6 +141,7 @@ def format_user_ack(case: Dict[str, Any]) -> str:
     if case.get("caseType") == "info":
         return f"Ваш вопрос принят. Передал(а) оператору. Номер: {case.get('caseId')}."
     return "Принял(а)."
+
 
 async def ensure_session(mongo, channel_id: str, chat_id: str, chat_type: str) -> Dict[str, Any]:
     sess = await mongo.sessions.find_one({"channelId": channel_id, "chatId": chat_id})
@@ -152,6 +159,7 @@ async def ensure_session(mongo, channel_id: str, chat_id: str, chat_type: str) -
         sess = await mongo.sessions.find_one({"channelId": channel_id, "chatId": chat_id})
     return sess
 
+
 async def load_active_case(mongo, sess: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     cid = sess.get("activeCaseId")
     if not cid:
@@ -165,7 +173,17 @@ async def load_active_case(mongo, sess: Dict[str, Any]) -> Optional[Dict[str, An
         return None
     return case
 
-async def create_case(mongo, *, channel_id: str, chat_id: str, chat_type: str, contact_name: Optional[str], case_type: str, nlu) -> Dict[str, Any]:
+
+async def create_case(
+    mongo,
+    *,
+    channel_id: str,
+    chat_id: str,
+    chat_type: str,
+    contact_name: Optional[str],
+    case_type: str,
+    nlu
+) -> Dict[str, Any]:
     cid = _case_id()
     case = {
         "caseId": cid,
@@ -193,17 +211,15 @@ async def create_case(mongo, *, channel_id: str, chat_id: str, chat_type: str, c
     )
     return await mongo.cases.find_one({"caseId": cid})
 
+
 async def update_case_with_message(mongo, case: Dict[str, Any], message: Dict[str, Any], nlu) -> Dict[str, Any]:
     ex = case.get("extracted", {})
-    # merge slots (do not overwrite existing with None)
     for k, v in nlu.slots.items():
         if v is not None:
             ex[k] = v
 
-    # merge categories
     cats = list(dict.fromkeys((case.get("categories") or []) + (nlu.categories or [])))
 
-    # evidence entry
     ev = {
         "messageId": message.get("messageId"),
         "dateTime": message.get("dateTime"),
@@ -224,9 +240,7 @@ async def update_case_with_message(mongo, case: Dict[str, Any], message: Dict[st
         "$push": {"evidence": ev},
     }
 
-    # attachments
     if message.get("contentUri") and message.get("type") != "text":
-        upd["$push"] = upd.get("$push", {})
         upd["$push"]["attachments"] = {
             "type": message.get("type"),
             "text": message.get("text"),
@@ -236,6 +250,7 @@ async def update_case_with_message(mongo, case: Dict[str, Any], message: Dict[st
 
     await mongo.cases.update_one({"caseId": case["caseId"]}, upd)
     return await mongo.cases.find_one({"caseId": case["caseId"]})
+
 
 async def close_case(mongo, case_id: str, status: str = "closed"):
     await mongo.cases.update_one({"caseId": case_id}, {"$set": {"status": status, "updatedAt": _now()}})
