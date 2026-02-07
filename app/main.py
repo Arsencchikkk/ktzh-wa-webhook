@@ -4,7 +4,7 @@ import hashlib
 import re
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from dateutil import parser
 from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
@@ -13,29 +13,39 @@ from pydantic import BaseModel
 
 from . import settings
 from .db import init_mongo, close_mongo
-from . import db as db_module
+from . import db as db_module  # IMPORTANT: use db_module.mongo (single global)
 from .wazzup_client import WazzupClient
 from .nlu import run_nlu
 from .dialog import (
-    ensure_session, load_active_case, create_case, update_case_with_message,
-    required_slots, build_question, format_dispatch_text, format_user_ack, close_case
+    ensure_session,
+    load_active_case,
+    create_case,
+    update_case_with_message,
+    required_slots,
+    build_question,
+    format_dispatch_text,
+    format_user_ack,
+    close_case,
 )
 from .routing import resolve_region, resolve_executor
 
 app = FastAPI(title="KTZH Smart Bot (Wazzup webhook)")
+
 wazzup: Optional[WazzupClient] = None
 
 
 # ----------------------------
-# time utils (ALWAYS tz-aware)
+# time helpers (ALWAYS tz-aware)
 # ----------------------------
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
+
 
 def _safe_parse_dt(v: Any) -> Optional[datetime]:
     if not v:
         return None
     if isinstance(v, datetime):
+        # ensure tz-aware
         return v if v.tzinfo else v.replace(tzinfo=timezone.utc)
     try:
         dt = parser.isoparse(str(v))
@@ -45,24 +55,93 @@ def _safe_parse_dt(v: Any) -> Optional[datetime]:
 
 
 # ----------------------------
-# auth / allowlist
+# text heuristics (context understanding)
 # ----------------------------
-def _auth_ok(request: Request) -> bool:
-    if settings.WEBHOOK_TOKEN:
-        return (request.query_params.get("token") or "").strip() == settings.WEBHOOK_TOKEN
-    return True
+_GREET_ONLY = {
+    "здравствуйте",
+    "привет",
+    "салам",
+    "сәлем",
+    "сәлеметсіз бе",
+    "добрый день",
+    "добрый вечер",
+    "доброе утро",
+}
 
-def _is_allowed_chat(chat_id: Optional[str]) -> bool:
-    # если список пуст — разрешаем всем
-    if not settings.ALLOWED_CHAT_IDS:
-        return True
-    if not chat_id:
-        return False
-    return chat_id in settings.ALLOWED_CHAT_IDS
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip().lower())
+
+
+def _is_greeting_only(text: str) -> bool:
+    t = _norm(text)
+    return t in _GREET_ONLY
+
+
+def _contains_greeting(text: str) -> bool:
+    t = _norm(text)
+    return any(g in t for g in ["здравствуйте", "привет", "салам", "сәлем", "добрый"])
+
+
+def _is_gratitude_only(text: str) -> bool:
+    t = _norm(text)
+    return t in {"благодарность", "алғыс", "рахмет", "спасибо"}
+
+
+def _has_case_type_words(text: str) -> bool:
+    t = _norm(text)
+    return any(w in t for w in ["жалоб", "шағым", "благодар", "алғыс", "спасибо", "рахмет", "забыл", "ұмыт", "потер", "жоғалт", "вещ", "телефон", "паспорт"])
+
+
+def _extract_train(text: str) -> Optional[str]:
+    # T58 / Т58 / T-58
+    t = (text or "").strip()
+    m = re.search(r"\b([TТ])\s*[-]?\s*(\d{1,4}[A-Za-zА-Яа-яЁё]?)\b", t)
+    if not m:
+        return None
+    return (m.group(1) + m.group(2)).upper().replace(" ", "").replace("-", "")
+
+
+def _extract_wagon(text: str) -> Optional[int]:
+    t = _norm(text)
+    m = re.search(r"\bвагон\s*(\d{1,2})\b", t)
+    if m:
+        return int(m.group(1))
+    # if only digits like "4"
+    if t.isdigit():
+        return int(t)
+    return None
+
+
+def _infer_intent(text: str, nlu_intent: str) -> str:
+    """
+    Heuristic override when NLU is weak:
+    - greeting-only => greeting
+    - greeting + complaint keywords => complaint
+    - gratitude keywords => gratitude (but not auto-close)
+    - lost keywords => lost_and_found
+    """
+    t = _norm(text)
+
+    if _is_greeting_only(t):
+        return "greeting"
+
+    # explicit complaint signals
+    if any(k in t for k in ["жалоб", "шағым", "ужас", "плохо", "холодно", "гряз", "санитар", "нет бумаги", "нет воды", "хам", "проблем", "не работает"]):
+        return "complaint"
+
+    # explicit lost&found signals
+    if any(k in t for k in ["забыл", "потерял", "оставил", "ұмытып", "жоғалт", "lost", "forgot"]):
+        return "lost_and_found"
+
+    # gratitude signals
+    if any(k in t for k in ["спасибо", "благодар", "рахмет", "алғыс"]):
+        return "gratitude"
+
+    return nlu_intent or "other"
 
 
 # ----------------------------
-# hashing
+# security & utils
 # ----------------------------
 def _hash_phone(phone: Optional[str]) -> Optional[str]:
     if not phone:
@@ -73,64 +152,33 @@ def _hash_phone(phone: Optional[str]) -> Optional[str]:
     return hashlib.sha256(raw).hexdigest()
 
 
-# ----------------------------
-# greeting helpers (human-like)
-# ----------------------------
-_GREET_PREFIX_RX = re.compile(r"^\s*(здравствуй(те)?|привет|добрый\s+день|добрый\s+вечер|сәлем(етсіз\s*бе)?|сәлем)\b", re.IGNORECASE)
-
-def _has_greeting_prefix(text: str) -> bool:
-    return bool(_GREET_PREFIX_RX.search(text or ""))
-
-def _hello_text(lang: str = "ru") -> str:
-    if lang == "kk":
-        return "Сәлеметсіз бе! Қалай көмектесе аламын? Жазыңыз: шағым / алғыс / ұмытылған зат."
-    return "Здравствуйте! Чем могу помочь? Напишите: жалоба / благодарность / забытая вещь."
+def _auth_ok(request: Request) -> bool:
+    if settings.WEBHOOK_TOKEN:
+        return (request.query_params.get("token") or "").strip() == settings.WEBHOOK_TOKEN
+    return True
 
 
-# ----------------------------
-# CONTEXT: interpret short replies by pendingQuestion
-# ----------------------------
-def _apply_context_slots(text: str, sess: Dict[str, Any], nlu) -> None:
-    """
-    Если пользователь отвечает коротко (например: "4"),
-    подставляем значения в слоты по last asked question (pendingQuestion).
-    """
-    t = (text or "").strip()
-    if not t:
+def _is_allowed_chat(chat_id: Optional[str]) -> bool:
+    # if list empty -> allow all
+    if not settings.ALLOWED_CHAT_IDS:
+        return True
+    if not chat_id:
+        return False
+    return chat_id in settings.ALLOWED_CHAT_IDS
+
+
+async def _send_text(channel_id: str, chat_type: str, chat_id: str, text: str, crm_message_id: str) -> None:
+    if not settings.BOT_SEND_ENABLED:
         return
-
-    pq = (sess or {}).get("pendingQuestion") or ""
-    pql = pq.lower()
-
-    # 1) digit-only reply
-    if t.isdigit():
-        if "вагон" in pql:
-            try:
-                nlu.slots["wagon"] = int(t)
-            except Exception:
-                nlu.slots["wagon"] = t
-        elif "мест" in pql:  # если потом добавишь seat
-            nlu.slots["seat"] = t
-
-    # 2) train reply when bot asked train/route
-    if ("поезд" in pql or "маршрут" in pql) and not nlu.slots.get("train"):
-        # accept: "т58", "T58", "58A"
-        m = re.match(r"^\s*([TТ]?\s*\d{1,4}[A-Za-zА-Яа-яЁё]?)\s*$", t)
-        if m:
-            val = m.group(1).upper().replace(" ", "")
-            nlu.slots["train"] = val
-
-    # 3) date/time reply when bot asked date/time
-    if ("дат" in pql or "врем" in pql) and (not nlu.slots.get("date") and not nlu.slots.get("time")):
-        n2 = run_nlu(t)
-        if n2.slots.get("date"):
-            nlu.slots["date"] = n2.slots["date"]
-        if n2.slots.get("time"):
-            nlu.slots["time"] = n2.slots["time"]
-
-    # 4) item reply when bot asked what item
-    if ("что" in pql or "предмет" in pql or "забы" in pql or "потер" in pql) and not nlu.slots.get("item"):
-        nlu.slots["item"] = t
+    if not wazzup:
+        return
+    await wazzup.send_text(
+        channel_id=channel_id,
+        chat_type=chat_type,
+        chat_id=chat_id,
+        text=text,
+        crm_message_id=crm_message_id,
+    )
 
 
 # ----------------------------
@@ -142,12 +190,11 @@ class DebugSend(BaseModel):
     chat_type: Optional[str] = None
     channel_id: Optional[str] = None
 
+
 @app.post("/debug/send")
 async def debug_send(request: Request, body: DebugSend):
     if not _auth_ok(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
-    if not wazzup:
-        raise HTTPException(status_code=503, detail="Wazzup client not ready")
 
     channel_id = body.channel_id or settings.TEST_CHANNEL_ID
     chat_id = body.chat_id or settings.TEST_CHAT_ID
@@ -155,6 +202,18 @@ async def debug_send(request: Request, body: DebugSend):
 
     if not (channel_id and chat_id and chat_type):
         raise HTTPException(status_code=400, detail="Need channel_id/chat_id/chat_type (or set TEST_* envs)")
+
+    if not settings.WAZZUP_API_KEY:
+        return {
+            "ok": False,
+            "response": {"error": "WAZZUP_API_KEY is empty"},
+            "used": {"channelId": channel_id, "chatType": chat_type, "chatId": chat_id},
+            "BOT_SEND_ENABLED": settings.BOT_SEND_ENABLED,
+            "HAS_WAZZUP_API_KEY": False,
+        }
+
+    if not wazzup:
+        raise HTTPException(status_code=503, detail="Wazzup client not ready")
 
     res = await wazzup.send_text(
         channel_id=channel_id,
@@ -164,14 +223,18 @@ async def debug_send(request: Request, body: DebugSend):
         crm_message_id=f"debug-{int(time.time())}",
     )
 
+    # try to normalize response
+    ok = getattr(res, "ok", None)
+    response = getattr(res, "response", None)
     return {
-        "ok": res.ok,
-        "response": res.response,
+        "ok": bool(ok) if ok is not None else True,
+        "response": response,
         "used": {"channelId": channel_id, "chatType": chat_type, "chatId": chat_id},
         "BOT_SEND_ENABLED": settings.BOT_SEND_ENABLED,
         "HAS_WAZZUP_API_KEY": bool(settings.WAZZUP_API_KEY),
         "ALLOWED_CHAT_IDS": settings.ALLOWED_CHAT_IDS,
     }
+
 
 @app.get("/debug/mongo")
 async def debug_mongo(request: Request):
@@ -203,8 +266,12 @@ async def debug_mongo(request: Request):
 async def startup():
     global wazzup
     await init_mongo()
-    wazzup = WazzupClient(settings.WAZZUP_API_KEY)
-    await wazzup.start()
+    if settings.WAZZUP_API_KEY:
+        wazzup = WazzupClient(settings.WAZZUP_API_KEY)
+        await wazzup.start()
+    else:
+        wazzup = None
+
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -212,6 +279,7 @@ async def shutdown():
     if wazzup:
         await wazzup.close()
     await close_mongo()
+
 
 @app.get("/")
 async def root():
@@ -244,7 +312,7 @@ async def webhooks(request: Request, background: BackgroundTasks):
 async def process_payload(payload: Dict[str, Any]):
     m = db_module.mongo
     if m is None:
-        print("❌ mongo is None (db_module.mongo). Check MONGODB_URI and init_mongo()")
+        print("❌ mongo is None. Check MONGODB_URI and init_mongo()")
         return
 
     try:
@@ -260,13 +328,13 @@ async def process_payload(payload: Dict[str, Any]):
             channel_id = msg.get("channelId")
             chat_id = msg.get("chatId")
             chat_type = msg.get("chatType")
+
             is_echo = bool(msg.get("isEcho", False))
             direction = "outbound" if is_echo else "inbound"
 
-            dt = _safe_parse_dt(msg.get("dateTime"))
+            dt = _safe_parse_dt(msg.get("dateTime")) or _now_utc()
 
-            # IMPORTANT: messageId is ONLY in filter and $setOnInsert (not in $set) to avoid conflict
-            doc_insert = {"messageId": message_id, "createdAt": dt or _now_utc()}
+            doc_insert = {"messageId": message_id, "createdAt": dt}
 
             doc_set = {
                 "channelId": channel_id,
@@ -287,7 +355,7 @@ async def process_payload(payload: Dict[str, Any]):
                 "updatedAt": _now_utc(),
             }
 
-            # ✅ always write message to Mongo
+            # store always
             try:
                 await m.messages.update_one(
                     {"messageId": message_id},
@@ -296,9 +364,9 @@ async def process_payload(payload: Dict[str, Any]):
                 )
             except Exception as e:
                 print("❌ Mongo write error:", repr(e))
-                return
+                continue
 
-            # bot triggers only for inbound non-echo
+            # only handle inbound human messages
             if direction != "inbound":
                 continue
             if not (channel_id and chat_id and chat_type):
@@ -307,76 +375,89 @@ async def process_payload(payload: Dict[str, Any]):
                 continue
 
             text = (msg.get("text") or "").strip()
-            nlu = run_nlu(text) if text else run_nlu("")
 
+            # session + active case (context memory)
             sess = await ensure_session(m, channel_id, chat_id, chat_type)
             active_case = await load_active_case(m, sess)
 
-            # ✅ attachments without text -> attach to active case (no spam)
-            if msg.get("contentUri") and active_case and not text:
-                await update_case_with_message(m, active_case, {"messageId": message_id, **doc_set}, nlu)
+            # attachments: add to active case and do not spam
+            if msg.get("contentUri") and active_case:
+                nlu = run_nlu("")  # no text
+                await update_case_with_message(m, active_case, doc_set, nlu)
                 continue
 
-            # ✅ greeting ONLY + no active case -> just greet like a real person
-            if nlu.intent == "greeting" and not active_case:
-                if wazzup:
-                    await wazzup.send_text(
-                        channel_id=channel_id, chat_type=chat_type, chat_id=chat_id,
-                        text=_hello_text(nlu.language),
-                        crm_message_id=f"bot-hello-{message_id}",
+            # greeting-only (NO CASE)
+            if _is_greeting_only(text) and not active_case:
+                await _send_text(
+                    channel_id, chat_type, chat_id,
+                    "Здравствуйте! Чем могу помочь? Напишите: жалоба / благодарность / забытая вещь.",
+                    f"bot-hello-{message_id}"
+                )
+                continue
+
+            # NLU + heuristic override
+            nlu = run_nlu(text) if text else run_nlu("")
+            nlu_intent = getattr(nlu, "intent", "other") or "other"
+            intent = _infer_intent(text, nlu_intent)
+
+            # if no active case and user wrote train/wagon without type -> draftSlots
+            train_hint = _extract_train(text)
+            wagon_hint = _extract_wagon(text)
+
+            if not active_case and (train_hint or wagon_hint is not None) and not _has_case_type_words(text):
+                draft = (sess or {}).get("draftSlots") or {}
+                if train_hint:
+                    draft["train"] = train_hint
+                if wagon_hint is not None:
+                    draft["wagon"] = wagon_hint
+
+                await m.sessions.update_one(
+                    {"channelId": channel_id, "chatId": chat_id},
+                    {"$set": {"draftSlots": draft, "updatedAt": _now_utc()}},
+                    upsert=True,
+                )
+
+                await _send_text(
+                    channel_id, chat_type, chat_id,
+                    "Понял(а). Это жалоба, благодарность или забытая вещь? Напишите одним словом и кратко суть.",
+                    f"bot-clarify-type-{message_id}"
+                )
+                continue
+
+            # If active case exists, DO NOT switch intent to "other" and DO NOT ask type again.
+            case = active_case
+            case_type = case.get("caseType") if case else intent
+
+            # If no active case and intent still unknown -> ask type
+            if not case and case_type in (None, "", "other", "greeting"):
+                await _send_text(
+                    channel_id, chat_type, chat_id,
+                    "Уточните, пожалуйста: жалоба / благодарность / забытая вещь?",
+                    f"bot-clarify-{message_id}"
+                )
+                continue
+
+            # Merge draft slots into nlu.slots when starting case
+            if not case:
+                draft = (sess or {}).get("draftSlots") or {}
+                try:
+                    slots = getattr(nlu, "slots", None)
+                    if slots is None:
+                        setattr(nlu, "slots", {})
+                        slots = nlu.slots
+                    if isinstance(slots, dict) and draft:
+                        for k, v in draft.items():
+                            slots.setdefault(k, v)
+                except Exception:
+                    pass
+
+                # clear draft
+                if (sess or {}).get("draftSlots"):
+                    await m.sessions.update_one(
+                        {"channelId": channel_id, "chatId": chat_id},
+                        {"$set": {"draftSlots": {}, "updatedAt": _now_utc()}},
+                        upsert=True,
                     )
-                continue
-
-            # ✅ if there IS active case -> ANY message is continuation (context!)
-            if active_case:
-                # apply context mapping by pendingQuestion (digit reply etc.)
-                _apply_context_slots(text, sess, nlu)
-
-                case = await update_case_with_message(m, active_case, {"messageId": message_id, **doc_set}, nlu)
-
-                # if user says just "здравствуйте" during active case -> politely continue with next question
-                if nlu.intent == "greeting":
-                    missing = required_slots(case)
-                    if missing:
-                        q = build_question(case, missing)
-                        if q and wazzup:
-                            pref = "Здравствуйте! " if nlu.language != "kk" else "Сәлеметсіз бе! "
-                            await wazzup.send_text(
-                                channel_id=channel_id, chat_type=chat_type, chat_id=chat_id,
-                                text=pref + q,
-                                crm_message_id=f"bot-continue-{case['caseId']}-{message_id}",
-                            )
-                            await m.sessions.update_one(
-                                {"channelId": channel_id, "chatId": chat_id},
-                                {"$set": {"pendingQuestion": q, "updatedAt": _now_utc()}},
-                                upsert=True,
-                            )
-                    else:
-                        if wazzup:
-                            msg_txt = "Здравствуйте! Я вижу вашу заявку, сейчас передам ответственным."
-                            if nlu.language == "kk":
-                                msg_txt = "Сәлеметсіз бе! Өтінішіңіз қабылданды, жауапты бөлімге жіберемін."
-                            await wazzup.send_text(
-                                channel_id=channel_id, chat_type=chat_type, chat_id=chat_id,
-                                text=msg_txt,
-                                crm_message_id=f"bot-continue2-{case['caseId']}-{message_id}",
-                            )
-                    continue
-
-            else:
-                # ✅ no active case: handle "other" nicely
-                case_type = nlu.intent
-                if case_type == "other":
-                    if wazzup:
-                        txt = "Понял. Это жалоба, благодарность или забытая вещь?"
-                        if nlu.language == "kk":
-                            txt = "Түсіндім. Бұл шағым ба, алғыс па, әлде ұмытылған зат па?"
-                        await wazzup.send_text(
-                            channel_id=channel_id, chat_type=chat_type, chat_id=chat_id,
-                            text=txt,
-                            crm_message_id=f"bot-clarify-{message_id}",
-                        )
-                    continue
 
                 # create case
                 contact_name = None
@@ -393,110 +474,111 @@ async def process_payload(payload: Dict[str, Any]):
                     case_type=case_type,
                     nlu=nlu,
                 )
-                case = await update_case_with_message(m, case, {"messageId": message_id, **doc_set}, nlu)
 
-            # ---- from here case ALWAYS exists ----
+            # update case with this message and apply pendingSlot answers
+            case = await update_case_with_message(m, case, doc_set, nlu)
 
-            # gratitude fast
-            if case.get("caseType") == "gratitude":
-                if wazzup:
-                    await wazzup.send_text(
-                        channel_id=channel_id, chat_type=chat_type, chat_id=chat_id,
-                        text=format_user_ack(case),
-                        crm_message_id=f"bot-gratitude-{message_id}",
-                    )
-                await close_case(m, case["caseId"], status="closed")
-                await m.sessions.update_one(
-                    {"channelId": channel_id, "chatId": chat_id},
-                    {"$set": {"activeCaseId": None, "pendingQuestion": None, "updatedAt": _now_utc()}},
-                    upsert=True,
-                )
-                continue
-
-            # info -> (optional) forward + ack + close
-            if case.get("caseType") == "info":
-                if settings.SUPPORT_TARGET and wazzup:
-                    txt = format_dispatch_text(case)
-                    await wazzup.send_text(
-                        channel_id=channel_id,
-                        chat_type=settings.SUPPORT_TARGET.get("chatType", "whatsapp"),
-                        chat_id=settings.SUPPORT_TARGET.get("chatId", chat_id),
-                        text=txt,
-                        crm_message_id=f"bot-support-{case['caseId']}",
-                    )
-                if wazzup:
-                    await wazzup.send_text(
-                        channel_id=channel_id, chat_type=chat_type, chat_id=chat_id,
-                        text=format_user_ack(case),
-                        crm_message_id=f"bot-info-ack-{message_id}",
-                    )
-                await close_case(m, case["caseId"], status="sent")
-                await m.sessions.update_one(
-                    {"channelId": channel_id, "chatId": chat_id},
-                    {"$set": {"activeCaseId": None, "pendingQuestion": None, "updatedAt": _now_utc()}},
-                    upsert=True,
-                )
-                continue
-
-            # ask missing slots (ONE question)
+            # Determine missing slots & ask next question
             missing = required_slots(case)
+
             if missing:
-                q = build_question(case, missing)
+                slot_key = missing[0]
+                question_text = build_question(case, missing)
 
-                # don't repeat same question
-                prev_q = (sess or {}).get("pendingQuestion")
-                if q and q != prev_q and wazzup:
-                    # human-like: if message started with greeting, soften response
-                    pref = "Понял(а). " if not _has_greeting_prefix(text) else "Здравствуйте! "
-                    if nlu.language == "kk":
-                        pref = "Түсіндім. " if not _has_greeting_prefix(text) else "Сәлеметсіз бе! "
+                # avoid repeating same question
+                sess2 = await m.sessions.find_one({"channelId": channel_id, "chatId": chat_id})
+                prev_slot = (sess2 or {}).get("pendingSlot")
+                prev_text = (sess2 or {}).get("pendingQuestion")
 
-                    await wazzup.send_text(
-                        channel_id=channel_id, chat_type=chat_type, chat_id=chat_id,
-                        text=pref + q,
-                        crm_message_id=f"bot-q-{case['caseId']}-{message_id}",
+                if slot_key != prev_slot or question_text != prev_text:
+                    await _send_text(
+                        channel_id, chat_type, chat_id,
+                        question_text,
+                        f"bot-q-{case['caseId']}-{message_id}"
                     )
+
                     await m.sessions.update_one(
                         {"channelId": channel_id, "chatId": chat_id},
-                        {"$set": {"pendingQuestion": q, "updatedAt": _now_utc()}},
+                        {"$set": {"pendingSlot": slot_key, "pendingQuestion": question_text, "updatedAt": _now_utc()}},
                         upsert=True,
                     )
                 continue
 
-            # dispatch ready
+            # Ready to dispatch / finalize
             dispatch_text = format_dispatch_text(case)
 
+            # gratitude: close only after details exist (required_slots already ensured)
+            if case.get("caseType") == "gratitude":
+                await _send_text(
+                    channel_id, chat_type, chat_id,
+                    "Спасибо за подробности! Передадим вашу благодарность команде 🙏",
+                    f"bot-gratitude-done-{message_id}",
+                )
+                await close_case(m, case["caseId"], status="closed")
+                await m.sessions.update_one(
+                    {"channelId": channel_id, "chatId": chat_id},
+                    {"$set": {"activeCaseId": None, "pendingSlot": None, "pendingQuestion": None, "updatedAt": _now_utc()}},
+                    upsert=True,
+                )
+                continue
+
+            # info -> support target (optional)
+            if case.get("caseType") == "info":
+                if settings.SUPPORT_TARGET:
+                    await _send_text(
+                        channel_id=channel_id,
+                        chat_type=settings.SUPPORT_TARGET.get("chatType", "whatsapp"),
+                        chat_id=settings.SUPPORT_TARGET.get("chatId", chat_id),
+                        text=dispatch_text,
+                        crm_message_id=f"bot-support-{case['caseId']}",
+                    )
+
+                await _send_text(
+                    channel_id, chat_type, chat_id,
+                    format_user_ack(case),
+                    f"bot-info-ack-{message_id}"
+                )
+                await close_case(m, case["caseId"], status="sent")
+                await m.sessions.update_one(
+                    {"channelId": channel_id, "chatId": chat_id},
+                    {"$set": {"activeCaseId": None, "pendingSlot": None, "pendingQuestion": None, "updatedAt": _now_utc()}},
+                    upsert=True,
+                )
+                continue
+
+            # lost_and_found -> lost&found target (group or phone)
             if case.get("caseType") == "lost_and_found":
-                # send to target (or skip)
-                if settings.LOST_FOUND_TARGET and wazzup:
-                    await wazzup.send_text(
+                if settings.LOST_FOUND_TARGET:
+                    await _send_text(
                         channel_id=channel_id,
                         chat_type=settings.LOST_FOUND_TARGET.get("chatType", "whatsgroup"),
                         chat_id=settings.LOST_FOUND_TARGET.get("chatId", chat_id),
                         text=dispatch_text,
                         crm_message_id=f"bot-lf-{case['caseId']}",
                     )
-                if wazzup:
-                    await wazzup.send_text(
-                        channel_id=channel_id, chat_type=chat_type, chat_id=chat_id,
-                        text=format_user_ack(case),
-                        crm_message_id=f"bot-lf-ack-{message_id}",
-                    )
+
+                await _send_text(
+                    channel_id, chat_type, chat_id,
+                    format_user_ack(case),
+                    f"bot-lf-ack-{message_id}"
+                )
+
                 await close_case(m, case["caseId"], status="sent")
                 await m.sessions.update_one(
                     {"channelId": channel_id, "chatId": chat_id},
-                    {"$set": {"activeCaseId": None, "pendingQuestion": None, "updatedAt": _now_utc()}},
+                    {"$set": {"activeCaseId": None, "pendingSlot": None, "pendingQuestion": None, "updatedAt": _now_utc()}},
                     upsert=True,
                 )
                 continue
 
+            # complaint -> executor by region
             if case.get("caseType") == "complaint":
-                ex = case.get("extracted", {})
+                ex = case.get("extracted", {}) or {}
                 region = resolve_region(ex.get("train"), ex.get("routeFrom"), ex.get("routeTo"))
                 executor = resolve_executor(region)
 
-                if executor.target_chat_id and executor.target_chat_type and wazzup:
-                    await wazzup.send_text(
+                if executor.target_chat_id and executor.target_chat_type:
+                    await _send_text(
                         channel_id=channel_id,
                         chat_type=executor.target_chat_type,
                         chat_id=executor.target_chat_id,
@@ -504,22 +586,21 @@ async def process_payload(payload: Dict[str, Any]):
                         crm_message_id=f"bot-complaint-{case['caseId']}",
                     )
 
-                if wazzup:
-                    await wazzup.send_text(
-                        channel_id=channel_id, chat_type=chat_type, chat_id=chat_id,
-                        text=format_user_ack(case),
-                        crm_message_id=f"bot-complaint-ack-{message_id}",
-                    )
+                await _send_text(
+                    channel_id, chat_type, chat_id,
+                    format_user_ack(case),
+                    f"bot-complaint-ack-{message_id}"
+                )
 
                 await close_case(m, case["caseId"], status="sent")
                 await m.sessions.update_one(
                     {"channelId": channel_id, "chatId": chat_id},
-                    {"$set": {"activeCaseId": None, "pendingQuestion": None, "updatedAt": _now_utc()}},
+                    {"$set": {"activeCaseId": None, "pendingSlot": None, "pendingQuestion": None, "updatedAt": _now_utc()}},
                     upsert=True,
                 )
                 continue
 
-        # 2) statuses
+        # 2) store statuses for analytics
         for st in statuses:
             mid = st.get("messageId")
             if not mid:
@@ -532,7 +613,6 @@ async def process_payload(payload: Dict[str, Any]):
                 )
             except Exception as e:
                 print("❌ Mongo status write error:", repr(e))
-                return
 
     except Exception as e:
         print("❌ process_payload crashed:", repr(e))
