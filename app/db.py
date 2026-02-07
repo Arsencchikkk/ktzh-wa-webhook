@@ -83,3 +83,14 @@ class MongoStore:
         suffix = secrets.token_hex(4).upper()
         prefix = "LOST" if case_type == "lost_and_found" else ("THANKS" if case_type == "gratitude" else "CMP")
         return f"KTZH-{dt}-{prefix}-{suffix}"
+
+    async def connect(self) -> None:
+        # pymongo подключается лениво, отдельный connect не нужен
+        return None
+
+    async def close(self) -> None:
+        try:
+            self.client.close()
+        except Exception:
+            pass
+
