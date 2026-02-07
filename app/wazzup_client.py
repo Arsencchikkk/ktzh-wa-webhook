@@ -1,35 +1,48 @@
 from __future__ import annotations
-from typing import Any, Dict
-import requests
 
-from settings import settings
+from typing import Any, Dict, Optional
+
+import httpx
 
 
 class WazzupClient:
-    def __init__(self) -> None:
-        self.base_url = "https://api.wazzup24.com"
-        self.session = requests.Session()
+    def __init__(self, api_key: str, base_url: str = "https://api.wazzup24.com"):
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+        self._client: Optional[httpx.AsyncClient] = None
 
-    def send_message(self, chat_id: str, channel_id: str, chat_type: str, text: str) -> Dict[str, Any]:
-        """
-        Wazzup: POST /v3/message
-        """
-        if not settings.WAZZUP_API_KEY:
-            return {"ok": False, "error": "WAZZUP_API_KEY is empty"}
+    async def start(self) -> None:
+        if self._client is None:
+            self._client = httpx.AsyncClient(
+                timeout=httpx.Timeout(15.0),
+                headers={"Authorization": f"Bearer {self.api_key}"},
+            )
 
-        url = f"{self.base_url}/v3/message"
-        headers = {"Authorization": f"Bearer {settings.WAZZUP_API_KEY}"}
+    async def close(self) -> None:
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
+
+    async def send_text(
+        self,
+        channel_id: str,
+        chat_type: str,
+        chat_id: str,
+        text: str,
+        crm_message_id: str,
+    ) -> Dict[str, Any]:
+        if not self._client:
+            await self.start()
+
         payload = {
             "channelId": channel_id,
-            "chatId": chat_id,
             "chatType": chat_type,
-            "content": {"text": text},
-            "type": "text",
+            "chatId": chat_id,
+            "text": text,
+            "crmMessageId": crm_message_id,
         }
-        r = self.session.post(url, json=payload, headers=headers, timeout=10)
-        try:
-            data = r.json()
-        except Exception:
-            data = {"raw": r.text}
 
-        return {"ok": r.ok, "status": r.status_code, "data": data}
+        url = f"{self.base_url}/v3/message"
+        r = await self._client.post(url, json=payload)
+        r.raise_for_status()
+        return r.json()
