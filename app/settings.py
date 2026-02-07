@@ -1,67 +1,63 @@
-import os
-import json
-from typing import Any, Dict, Optional
+from __future__ import annotations
 
-def _get_bool(name: str, default: bool = False) -> bool:
+import os
+from dataclasses import dataclass
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+def env_str(name: str, default: str | None = None) -> str | None:
     v = os.getenv(name)
     if v is None:
         return default
-    return v.strip().lower() in ("1", "true", "yes", "y", "on")
+    v = v.strip()
+    return v if v != "" else default
 
-def _get_json(name: str, default: Any) -> Any:
-    v = os.getenv(name, "").strip()
-    if not v:
+
+def env_int(name: str, default: int) -> int:
+    v = os.getenv(name)
+    if v is None or v.strip() == "":
         return default
     try:
-        return json.loads(v)
-    except Exception:
+        return int(v.strip())
+    except ValueError:
         return default
 
 
+def env_bool(name: str, default: bool = False) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    s = v.strip().lower()
+    if s in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if s in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    return default
 
 
-# Mongo
-MONGODB_URI = os.getenv("MONGODB_URI", "").strip()
-DB_NAME = os.getenv("DB_NAME", "ktzh").strip()
-COL_MESSAGES = os.getenv("COL_MESSAGES", "messages").strip()
-COL_SESSIONS = os.getenv("COL_SESSIONS", "sessions").strip()
-COL_CASES = os.getenv("COL_CASES", "cases").strip()
+@dataclass(frozen=True)
+class Settings:
+    APP_NAME: str = env_str("APP_NAME", "ktzh-wazzup-bot") or "ktzh-wazzup-bot"
+
+    # Wazzup
+    WAZZUP_API_KEY: str | None = env_str("WAZZUP_API_KEY", None)
+    WAZZUP_BASE_URL: str = env_str("WAZZUP_BASE_URL", "https://api.wazzup24.com") or "https://api.wazzup24.com"
+    WEBHOOK_TOKEN: str | None = env_str("WEBHOOK_TOKEN", None)
+    BOT_SEND_ENABLED: bool = env_bool("BOT_SEND_ENABLED", True)
+
+    # Hashing / privacy
+    PHONE_HASH_SALT: str = env_str("PHONE_HASH_SALT", "dev-salt") or "dev-salt"
+
+    # Mongo
+    MONGODB_URI: str | None = env_str("MONGODB_URI", None)
+    DB_NAME: str = env_str("DB_NAME", "ktzh_bot") or "ktzh_bot"
+    COL_MESSAGES: str = env_str("COL_MESSAGES", "messages") or "messages"
+    COL_SESSIONS: str = env_str("COL_SESSIONS", "sessions") or "sessions"
+    COL_CASES: str = env_str("COL_CASES", "cases") or "cases"
+
+    
 
 
-# Webhook security
-WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "").strip()
-TEST_ONLY_CHAT_ID = os.getenv("TEST_ONLY_CHAT_ID", "").strip()
-
-# Optional phone hashing
-PHONE_HASH_SALT = os.getenv("PHONE_HASH_SALT", "").strip()
-
-# Wazzup API
-WAZZUP_API_KEY = os.getenv("WAZZUP_API_KEY", "").strip()
-BOT_SEND_ENABLED = _get_bool("BOT_SEND_ENABLED", default=True)
-
-# Routing (replace with your real executors later)
-# Example:
-# EXECUTORS_JSON='{"center":{"chatType":"whatsapp","chatId":"77001112233"}, "east":{...}}'
-EXECUTORS: Dict[str, Dict[str, str]] = _get_json("EXECUTORS_JSON", default={})
-
-# Lost&Found target (group or phone)
-# Example:
-# LOST_FOUND_TARGET_JSON='{"chatType":"whatsgroup","chatId":"<group_chat_id_from_webhook>"}'
-LOST_FOUND_TARGET: Dict[str, str] = _get_json("LOST_FOUND_TARGET_JSON", default={})
-
-# Support/Operator target for info requests
-SUPPORT_TARGET: Dict[str, str] = _get_json("SUPPORT_TARGET_JSON", default={})
-
-# Routing rules (optional)
-# Example:
-# ROUTING_RULES_JSON='[{"match":{"train_regex":"^T58$"},"region":"east"}]'
-ROUTING_RULES = _get_json("ROUTING_RULES_JSON", default=[])
-# ===== TEST MODE (only your number) =====
-TEST_CHANNEL_ID = os.getenv("TEST_CHANNEL_ID", "92f607bd-a68b-44c2-b718-aed344d72435").strip()
-TEST_CHAT_ID = os.getenv("TEST_CHAT_ID", "77052817121").strip()
-TEST_CHAT_TYPE = os.getenv("TEST_CHAT_TYPE", "whatsapp").strip()
-
-# Ответы бота только этим chatId (через запятую): "77052817121,7777...."
-_allowed = os.getenv("ALLOWED_CHAT_IDS", "77052817121").strip()
-ALLOWED_CHAT_IDS = [x.strip() for x in _allowed.split(",") if x.strip()] if _allowed else []
 settings = Settings()
