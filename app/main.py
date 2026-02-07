@@ -77,8 +77,7 @@ def _check_token(request: Request) -> None:
             raise HTTPException(status_code=401, detail="Invalid webhook token")
 
 
-async def _process_items(items: list, background: BackgroundTasks) -> None:
-    # делаем sync внутри background, чтобы webhook отвечал быстро
+async def _process_items(items: list) -> None:
     for item in items:
         msg = extract_inbound(item)
         if not msg or not msg["chatId"]:
@@ -107,10 +106,13 @@ async def _process_items(items: list, background: BackgroundTasks) -> None:
             )
 
 
+
+
+
 # ✅ ДВА маршрута: /webhooks и /webhook/wazzup
 @app.post("/webhooks")
-async def webhooks_alias(request: Request):
-    return await wazzup_webhook(request)
+async def webhooks_alias(request: Request, background: BackgroundTasks):
+    return await wazzup_webhook(request, background)
 
 @app.post("/webhook/wazzup")
 async def wazzup_webhook(request: Request, background: BackgroundTasks):
@@ -119,5 +121,6 @@ async def wazzup_webhook(request: Request, background: BackgroundTasks):
     payload = await request.json()
     items = payload if isinstance(payload, list) else [payload]
 
-    background.add_task(_process_items, items, background)
+    background.add_task(_process_items, items)
     return JSONResponse({"ok": True, "queued": len(items)})
+
