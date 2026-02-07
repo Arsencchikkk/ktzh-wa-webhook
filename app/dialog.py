@@ -7,6 +7,7 @@ import time
 
 from .settings import settings
 
+from .nlu import build_nlu, extract_train_and_car, detect_aggression_and_flood, normalize
 
 # -------------------------
 # Normalization / tokens
