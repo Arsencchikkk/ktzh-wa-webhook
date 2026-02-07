@@ -3,130 +3,60 @@ from __future__ import annotations
 import re
 import secrets
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
-
-from . import settings
+from typing import Any, Dict, List, Optional, Tuple
 
 
+# ----------------------------
+# time helpers (ALWAYS tz-aware UTC)
+# ----------------------------
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
-
-def _gen_case_id() -> str:
-    # KTZH-YYYYMMDD-XXXXXXXX
-    d = _now_utc().strftime("%Y%m%d")
-    tail = secrets.token_hex(4).upper()
-    return f"KTZH-{d}-{tail}"
-
-
-def _norm(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip().lower())
-
-
-def _extract_train_from_text(text: str) -> Optional[str]:
-    t = (text or "").strip()
-    m = re.search(r"\b([TТ])\s*[-]?\s*(\d{1,4}[A-Za-zА-Яа-яЁё]?)\b", t)
-    if not m:
+def _as_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    if dt is None:
         return None
-    return (m.group(1) + m.group(2)).upper().replace(" ", "").replace("-", "")
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
-def _extract_wagon_from_text(text: str) -> Optional[int]:
-    t = _norm(text)
-    m = re.search(r"\bвагон\s*(\d{1,2})\b", t)
+# ----------------------------
+# lightweight entity extraction
+# ----------------------------
+TRAIN_RE = re.compile(r"\b[тt]\s*-?\s*(\d{1,4})\b", re.IGNORECASE)
+CAR_RE = re.compile(r"\bвагон\s*(\d{1,2})\b", re.IGNORECASE)
+SEAT_RE = re.compile(r"\bместо\s*(\d{1,3}[а-яa-z]?)\b", re.IGNORECASE)
+
+LOST_KEYWORDS = ("забыл", "оставил", "потерял", "утерял", "сумк", "рюкзак", "телефон", "кошелек", "паспорт", "вещ")
+
+
+def extract_entities(text: str) -> Dict[str, Any]:
+    t = (text or "").strip()
+    out: Dict[str, Any] = {}
+
+    m = TRAIN_RE.search(t)
     if m:
-        return int(m.group(1))
-    if t.isdigit():
-        return int(t)
-    return None
+        out["train"] = f"T{m.group(1)}".upper()
 
-
-def _extract_seat_from_text(text: str) -> Optional[int]:
-    t = _norm(text)
-    m = re.search(r"\bместо\s*(\d{1,3})\b", t)
+    m = CAR_RE.search(t)
     if m:
-        return int(m.group(1))
-    return None
+        out["carNumber"] = int(m.group(1))
+
+    m = SEAT_RE.search(t)
+    if m:
+        out["seat"] = m.group(1).upper()
+
+    # если просто цифра — это может быть вагон/место, но решаем по pendingSlot
+    return out
 
 
-def _extract_item_guess(text: str) -> Optional[str]:
-    """
-    Very simple heuristic: if message contains lost keywords, keep whole message as item description.
-    """
-    t = _norm(text)
-    if any(k in t for k in ["забыл", "потерял", "оставил", "ұмыт", "жоғалт", "forgot", "lost"]):
-        return text.strip()
-    return None
-
-
-def _slot_key_aliases() -> Dict[str, List[str]]:
-    return {
-        "train": ["train", "poezd", "поезд", "т", "t"],
-        "wagon": ["wagon", "car", "вагон"],
-        "seat": ["seat", "place", "место"],
-        "routeFrom": ["from", "routeFrom", "откуда", "станция_отправления"],
-        "routeTo": ["to", "routeTo", "куда", "станция_назначения"],
-        "item": ["item", "lostItem", "thing", "вещь", "предмет"],
-        "details": ["details", "desc", "description", "problem", "жалоба", "текст"],
-        "gratitudeText": ["gratitudeText", "thanks", "благодарность_текст"],
-    }
-
-
-def _merge_extracted(extracted: Dict[str, Any], nlu: Any, message_doc: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Merge NLU slots + heuristic extraction from text.
-    """
-    text = (message_doc.get("text") or "").strip()
-
-    slots = {}
-    try:
-        slots = getattr(nlu, "slots", {}) or {}
-    except Exception:
-        slots = {}
-
-    # normalize slot names
-    aliases = _slot_key_aliases()
-
-    # copy known aliases from slots into extracted
-    for target_key, keys in aliases.items():
-        for k in keys:
-            if isinstance(slots, dict) and k in slots and slots[k] not in (None, "", []):
-                extracted.setdefault(target_key, slots[k])
-
-    # heuristics from text if missing
-    if not extracted.get("train"):
-        tr = _extract_train_from_text(text)
-        if tr:
-            extracted["train"] = tr
-
-    if extracted.get("wagon") in (None, "", 0):
-        w = _extract_wagon_from_text(text)
-        if w is not None:
-            extracted["wagon"] = w
-
-    if not extracted.get("seat"):
-        s = _extract_seat_from_text(text)
-        if s is not None:
-            extracted["seat"] = s
-
-    # complaint details
-    if not extracted.get("details") and text:
-        extracted["details"] = text
-
-    # item guess for lost&found
-    if not extracted.get("item"):
-        it = _extract_item_guess(text)
-        if it:
-            extracted["item"] = it
-
-    # gratitude details: if message is not only "спасибо" etc.
-    if text and len(text) >= 10 and any(k in _norm(text) for k in ["спасибо", "благодар", "рахмет", "алғыс"]):
-        extracted.setdefault("gratitudeText", text)
-
-    return extracted
-
-
+# ----------------------------
+# Session
+# ----------------------------
 async def ensure_session(m, channel_id: str, chat_id: str, chat_type: str) -> Dict[str, Any]:
+    """
+    ВАЖНО: НЕ писать одни и те же поля в $setOnInsert и $set.
+    """
     now = _now_utc()
     await m.sessions.update_one(
         {"channelId": channel_id, "chatId": chat_id},
@@ -136,6 +66,9 @@ async def ensure_session(m, channel_id: str, chat_id: str, chat_type: str) -> Di
                 "chatId": chat_id,
                 "createdAt": now,
                 "draftSlots": {},
+                "activeCases": {},     # {"complaint": caseId, "lost_and_found": caseId, ...}
+                "pendingQuestion": None,
+                "pendingSlot": None,
             },
             "$set": {
                 "chatType": chat_type,
@@ -148,18 +81,78 @@ async def ensure_session(m, channel_id: str, chat_id: str, chat_type: str) -> Di
     return sess or {}
 
 
+async def _set_pending(m, channel_id: str, chat_id: str, question: Optional[str], slot: Optional[str]) -> None:
+    await m.sessions.update_one(
+        {"channelId": channel_id, "chatId": chat_id},
+        {"$set": {"pendingQuestion": question, "pendingSlot": slot, "updatedAt": _now_utc()}},
+        upsert=True,
+    )
 
-async def load_active_case(m, session: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    cid = (session or {}).get("activeCaseId")
-    if not cid:
-        return None
-    case = await m.cases.find_one({"caseId": cid})
-    if not case:
-        return None
-    # if already closed/sent -> do not continue it
-    if case.get("status") in ("closed", "sent"):
-        return None
-    return case
+
+async def _update_draft_slots(m, channel_id: str, chat_id: str, patch: Dict[str, Any]) -> None:
+    if not patch:
+        return
+    # draftSlots.x = val
+    upd = {f"draftSlots.{k}": v for k, v in patch.items()}
+    upd["updatedAt"] = _now_utc()
+    await m.sessions.update_one({"channelId": channel_id, "chatId": chat_id}, {"$set": upd}, upsert=True)
+
+
+# ----------------------------
+# Cases
+# ----------------------------
+def _new_case_id() -> str:
+    return f"KTZH-{_now_utc().strftime('%Y%m%d')}-{secrets.token_hex(4).upper()}"
+
+
+async def load_case(m, case_id: str) -> Optional[Dict[str, Any]]:
+    return await m.cases.find_one({"caseId": case_id})
+
+
+async def load_active_case(m, sess: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Возвращает "главный" активный кейс (если есть).
+    """
+    # backward compatibility
+    cid = sess.get("activeCaseId")
+    if cid:
+        return await load_case(m, cid)
+
+    ac = sess.get("activeCases") or {}
+    if isinstance(ac, dict):
+        # приоритет: complaint -> lost -> info -> gratitude
+        for k in ("complaint", "lost_and_found", "info", "gratitude"):
+            if ac.get(k):
+                c = await load_case(m, ac[k])
+                if c and c.get("status") in ("collecting", "open"):
+                    return c
+    return None
+
+
+async def load_active_case_by_type(m, sess: Dict[str, Any], case_type: str) -> Optional[Dict[str, Any]]:
+    ac = sess.get("activeCases") or {}
+    if isinstance(ac, dict) and ac.get(case_type):
+        c = await load_case(m, ac[case_type])
+        if c and c.get("status") in ("collecting", "open"):
+            return c
+    return None
+
+
+async def set_active_case(m, channel_id: str, chat_id: str, case_type: str, case_id: str, make_primary: bool = True) -> None:
+    patch = {
+        f"activeCases.{case_type}": case_id,
+        "updatedAt": _now_utc(),
+    }
+    if make_primary:
+        patch["activeCaseId"] = case_id  # optional primary pointer
+    await m.sessions.update_one({"channelId": channel_id, "chatId": chat_id}, {"$set": patch}, upsert=True)
+
+
+async def close_case(m, case_id: str, status: str = "closed") -> None:
+    await m.cases.update_one(
+        {"caseId": case_id},
+        {"$set": {"status": status, "updatedAt": _now_utc()}},
+    )
 
 
 async def create_case(
@@ -169,14 +162,13 @@ async def create_case(
     chat_type: str,
     contact_name: Optional[str],
     case_type: str,
-    nlu: Any,
+    language: str = "ru",
+    seed_extracted: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     now = _now_utc()
-    case_id = _gen_case_id()
+    case_id = _new_case_id()
 
-    language = getattr(nlu, "language", None) or "ru"
-    case_type = case_type or "other"
-
+    extracted = seed_extracted or {}
     doc = {
         "caseId": case_id,
         "status": "collecting",
@@ -186,282 +178,287 @@ async def create_case(
         "chatType": chat_type,
         "contactName": contact_name,
         "language": language,
-        "categories": [],
-        "severity": {},
-        "extracted": {},
+        "extracted": extracted,
         "evidence": [],
         "attachments": [],
         "lastText": None,
         "createdAt": now,
         "updatedAt": now,
     }
-
     await m.cases.insert_one(doc)
-
-    # bind session
-    await m.sessions.update_one(
-        {"channelId": channel_id, "chatId": chat_id},
-        {"$set": {"activeCaseId": case_id, "pendingSlot": None, "pendingQuestion": None, "updatedAt": now}},
-        upsert=True,
-    )
-
-    return await m.cases.find_one({"caseId": case_id})
+    return doc
 
 
-async def _apply_pending_slot_answer(m, case: Dict[str, Any], message_doc: Dict[str, Any]) -> None:
-    """
-    If bot previously asked something, interpret current message as answer.
-    """
-    channel_id = case["channelId"]
-    chat_id = case["chatId"]
-
-    sess = await m.sessions.find_one({"channelId": channel_id, "chatId": chat_id})
-    pending_slot = (sess or {}).get("pendingSlot")
-    if not pending_slot:
-        return
-
-    text = (message_doc.get("text") or "").strip()
-    ex = case.get("extracted", {}) or {}
-
-    # map slot -> how to parse
-    if pending_slot == "train":
-        tr = _extract_train_from_text(text)
-        if tr:
-            ex["train"] = tr
-
-    elif pending_slot == "wagon":
-        w = _extract_wagon_from_text(text)
-        if w is not None:
-            ex["wagon"] = w
-
-    elif pending_slot == "details":
-        if text:
-            ex["details"] = text
-
-    elif pending_slot == "gratitudeText":
-        if text and len(text) >= 5:
-            ex["gratitudeText"] = text
-
-    elif pending_slot == "item":
-        if text and len(text) >= 3:
-            ex["item"] = text
-
-    elif pending_slot == "seat":
-        s = _extract_seat_from_text(text)
-        if s is not None:
-            ex["seat"] = s
-        else:
-            # allow "12" as seat
-            if _norm(text).isdigit():
-                ex["seat"] = int(_norm(text))
-
-    # clear pending slot
-    await m.sessions.update_one(
-        {"channelId": channel_id, "chatId": chat_id},
-        {"$set": {"pendingSlot": None, "pendingQuestion": None, "updatedAt": _now_utc()}},
-        upsert=True,
-    )
-
-    await m.cases.update_one(
-        {"caseId": case["caseId"]},
-        {"$set": {"extracted": ex, "updatedAt": _now_utc()}},
-    )
-
-
-async def update_case_with_message(m, case: Dict[str, Any], message_doc: Dict[str, Any], nlu: Any) -> Dict[str, Any]:
-    """
-    - append evidence
-    - merge extracted fields from NLU + heuristics
-    - apply pendingSlot answer if any
-    """
-    now = _now_utc()
-
-    ev = {
-        "messageId": message_doc.get("messageId"),
-        "dateTime": message_doc.get("dateTime"),
-        "text": message_doc.get("text"),
-        "contentUri": message_doc.get("contentUri"),
-        "type": message_doc.get("type"),
-        "direction": message_doc.get("direction"),
-    }
-
-    extracted = case.get("extracted", {}) or {}
-    extracted = _merge_extracted(extracted, nlu, message_doc)
-
-    # attachments list
-    attachments = case.get("attachments", []) or []
-    if message_doc.get("contentUri"):
-        attachments.append(
-            {
-                "messageId": message_doc.get("messageId"),
-                "contentUri": message_doc.get("contentUri"),
-                "type": message_doc.get("type"),
-                "dateTime": message_doc.get("dateTime"),
-            }
-        )
-
-    await m.cases.update_one(
-        {"caseId": case["caseId"]},
-        {
-            "$set": {
-                "lastText": (message_doc.get("text") or "").strip(),
-                "extracted": extracted,
-                "attachments": attachments,
-                "updatedAt": now,
-            },
-            "$push": {"evidence": ev},
-        },
-    )
-
-    # reload and apply pending slot answer (so "4" works correctly)
-    fresh = await m.cases.find_one({"caseId": case["caseId"]})
-    await _apply_pending_slot_answer(m, fresh, message_doc)
-
-    return await m.cases.find_one({"caseId": case["caseId"]})
+def _normalize_free_text(text: str) -> str:
+    return (text or "").strip()
 
 
 def required_slots(case: Dict[str, Any]) -> List[str]:
-    """
-    Minimal "human" requirements:
-    - complaint: train + wagon + details (details can be initial message)
-    - gratitude: gratitudeText (not just "Благодарность")
-    - lost_and_found: train + item + seat (wagon optional but desirable)
-    - info: details
-    """
-    ex = case.get("extracted", {}) or {}
-    ctype = case.get("caseType") or "other"
-
+    ct = case.get("caseType")
+    ex = case.get("extracted") or {}
     missing: List[str] = []
 
-    if ctype == "complaint":
+    if ct == "complaint":
+        # по жалобе просим поезд и вагон ASAP
         if not ex.get("train"):
             missing.append("train")
-        if ex.get("wagon") in (None, "", 0):
-            missing.append("wagon")
-        # details must be meaningful
-        details = (ex.get("details") or "").strip()
-        if not details or len(details) < 8:
-            missing.append("details")
+        if not ex.get("carNumber"):
+            missing.append("carNumber")
+        if not ex.get("complaintText"):
+            missing.append("complaintText")
 
-    elif ctype == "gratitude":
-        gt = (ex.get("gratitudeText") or "").strip()
-        # if only "благодарность/спасибо" => ask more
-        if not gt or len(gt) < 10 or _norm(gt) in {"благодарность", "спасибо", "рахмет", "алғыс"}:
-            missing.append("gratitudeText")
-
-    elif ctype == "lost_and_found":
+    elif ct == "lost_and_found":
         if not ex.get("train"):
             missing.append("train")
-        item = (ex.get("item") or "").strip()
-        if not item or len(item) < 5:
-            missing.append("item")
+        if not ex.get("carNumber"):
+            missing.append("carNumber")
         if not ex.get("seat"):
             missing.append("seat")
+        if not ex.get("item"):
+            missing.append("item")
+        if not ex.get("when"):
+            missing.append("when")
 
-    elif ctype == "info":
-        details = (ex.get("details") or "").strip()
-        if not details or len(details) < 5:
-            missing.append("details")
+    elif ct == "gratitude":
+        # одно слово "Благодарность" — недостаточно
+        if not ex.get("gratitudeText"):
+            missing.append("gratitudeText")
+
+    elif ct == "info":
+        if not ex.get("question"):
+            missing.append("question")
 
     return missing
 
 
-def build_question(case: Dict[str, Any], missing: List[str]) -> str:
-    lang = case.get("language") or "ru"
-    slot = missing[0] if missing else None
+def build_question(case: Dict[str, Any], slot: str) -> Tuple[str, str]:
+    ct = case.get("caseType")
 
-    # RU/KZ minimal
-    ru = {
-        "train": "Уточните, пожалуйста, номер поезда (например: Т58).",
-        "wagon": "Уточните, пожалуйста, номер вагона.",
-        "details": "Опишите, пожалуйста, подробнее, что именно случилось (1–2 предложения).",
-        "gratitudeText": "Спасибо! Напишите, пожалуйста, за что именно хотите поблагодарить (пару предложений).",
-        "item": "Что именно вы забыли? Опишите предмет (цвет/бренд/что внутри).",
-        "seat": "Укажите ваше место (номер места) или хотя бы расположение (верх/низ, купе/плацкарт).",
-    }
-    kk = {
-        "train": "Пойыз нөмірін жазыңыз (мысалы: Т58).",
-        "wagon": "Вагон нөмірін жазыңыз.",
-        "details": "Не болғанын қысқаша жазыңыз (1–2 сөйлем).",
-        "gratitudeText": "Рақмет! Кімге/не үшін алғыс айтқыңыз келеді? Қысқаша жазыңыз.",
-        "item": "Нені ұмытып кеттіңіз? Затты сипаттаңыз (түсі/бренд/ішінде не бар).",
-        "seat": "Орын нөмірін жазыңыз немесе орналасуын (жоғары/төмен, купе/плацкарт).",
-    }
+    if ct == "complaint":
+        if slot == "train":
+            return ("Уточните, пожалуйста, номер поезда (например: Т58).", "train")
+        if slot == "carNumber":
+            return ("Уточните, пожалуйста, номер вагона.", "carNumber")
+        if slot == "complaintText":
+            return ("Опишите, пожалуйста, подробнее, что именно случилось (1–2 предложения).", "complaintText")
 
-    table = kk if lang == "kk" else ru
-    return table.get(slot, "Уточните, пожалуйста, детали.")
+    if ct == "lost_and_found":
+        if slot == "train":
+            return ("Уточните номер поезда (например: Т58).", "train")
+        if slot == "carNumber":
+            return ("Уточните номер вагона, где оставили вещь.", "carNumber")
+        if slot == "seat":
+            return ("Уточните место (например: место 12) — если не помните, напишите «не помню».", "seat")
+        if slot == "item":
+            return ("Опишите вещь: что это, цвет/размер, что внутри (если было).", "item")
+        if slot == "when":
+            return ("Когда примерно оставили/обнаружили пропажу? (дата/время, хотя бы примерно)", "when")
+
+    if ct == "gratitude":
+        if slot == "gratitudeText":
+            return ("Спасибо! Кого и за что хотите поблагодарить? (1–2 предложения)", "gratitudeText")
+
+    if ct == "info":
+        if slot == "question":
+            return ("Уточните, пожалуйста, ваш вопрос.", "question")
+
+    return ("Уточните, пожалуйста, детали.", slot)
+
+
+async def update_case_with_message(
+    m,
+    case: Dict[str, Any],
+    msg_doc: Dict[str, Any],
+    nlu: Any,
+    sess: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Обновляет extracted + evidence + attachments.
+    Также учитывает pendingSlot из session и draftSlots.
+    """
+    now = _now_utc()
+
+    text = _normalize_free_text(msg_doc.get("text") or "")
+    ex = dict(case.get("extracted") or {})
+
+    # 1) базовая экстракция из текста
+    ent = extract_entities(text)
+
+    # 2) если есть pendingSlot — пытаемся интерпретировать ответ
+    pending_slot = (sess or {}).get("pendingSlot")
+    if pending_slot:
+        t = text.strip()
+        if pending_slot == "carNumber" and t.isdigit():
+            ent["carNumber"] = int(t)
+        elif pending_slot == "train":
+            mtrain = TRAIN_RE.search(t)
+            if mtrain:
+                ent["train"] = f"T{mtrain.group(1)}".upper()
+        elif pending_slot == "seat":
+            # место может быть "12", "12А", или "не помню"
+            if t.lower() in ("не помню", "не знаю"):
+                ent["seat"] = "UNKNOWN"
+            else:
+                ent["seat"] = t.upper()
+        elif pending_slot in ("complaintText", "gratitudeText", "item", "when", "question"):
+            ent[pending_slot] = t
+
+    # 3) подтягиваем из nlu (если он у тебя умеет)
+    # (бережно: только если поле есть)
+    if getattr(nlu, "language", None):
+        ex["language"] = nlu.language
+
+    # 4) заполняем extracted по типу кейса
+    ct = case.get("caseType")
+    if ct == "complaint":
+        if ent.get("train"):
+            ex["train"] = ent["train"]
+        if ent.get("carNumber") is not None:
+            ex["carNumber"] = ent["carNumber"]
+
+        # complaintText: если текст не короткий и не чисто "Т58"/"5"
+        if "complaintText" in ent:
+            ex["complaintText"] = ent["complaintText"]
+        else:
+            # если в сообщении уже есть суть жалобы — сохраняем
+            if len(text) >= 8 and not TRAIN_RE.fullmatch(text.strip()) and not text.strip().isdigit():
+                ex["complaintText"] = text
+
+    elif ct == "lost_and_found":
+        if ent.get("train"):
+            ex["train"] = ent["train"]
+        if ent.get("carNumber") is not None:
+            ex["carNumber"] = ent["carNumber"]
+        if ent.get("seat"):
+            ex["seat"] = ent["seat"]
+        if ent.get("item"):
+            ex["item"] = ent["item"]
+        if ent.get("when"):
+            ex["when"] = ent["when"]
+
+        # если сообщение содержит “оставил/забыл …” — можно записать item как весь текст, если item пустой
+        if not ex.get("item") and any(k in text.lower() for k in LOST_KEYWORDS) and len(text) > 8:
+            ex["item"] = text
+
+    elif ct == "gratitude":
+        if "gratitudeText" in ent:
+            ex["gratitudeText"] = ent["gratitudeText"]
+        else:
+            # если это не просто "благодарность"
+            if len(text) >= 10 and text.lower().strip() not in ("благодарность", "спасибо", "рахмет"):
+                ex["gratitudeText"] = text
+
+    elif ct == "info":
+        if "question" in ent:
+            ex["question"] = ent["question"]
+        else:
+            if len(text) >= 5:
+                ex["question"] = text
+
+    # 5) evidence & attachments
+    evidence = case.get("evidence") or []
+    if text:
+        evidence.append({"at": now, "text": text, "messageId": msg_doc.get("messageId")})
+
+    attachments = case.get("attachments") or []
+    if msg_doc.get("contentUri"):
+        attachments.append({"at": now, "contentUri": msg_doc.get("contentUri"), "type": msg_doc.get("type")})
+
+    await m.cases.update_one(
+        {"caseId": case["caseId"]},
+        {"$set": {
+            "extracted": ex,
+            "evidence": evidence[-50:],   # ограничим
+            "attachments": attachments[-20:],
+            "lastText": text or case.get("lastText"),
+            "updatedAt": now,
+        }},
+    )
+    case = await m.cases.find_one({"caseId": case["caseId"]})
+    return case or case
 
 
 def format_dispatch_text(case: Dict[str, Any]) -> str:
-    ex = case.get("extracted", {}) or {}
-    ev = case.get("evidence", []) or []
-    last_msgs = []
-    for x in ev[-3:]:
-        t = (x.get("text") or "").strip()
-        if t:
-            last_msgs.append(t)
+    ct = case.get("caseType")
+    ex = case.get("extracted") or {}
+    lines = [f"Заявка: {case.get('caseId')}", f"Тип: {ct}", f"Контакт: {case.get('contactName') or '-'}"]
 
-    train = ex.get("train")
-    wagon = ex.get("wagon")
-    seat = ex.get("seat")
-    item = ex.get("item")
-    details = ex.get("details")
-    gt = ex.get("gratitudeText")
+    if ct == "complaint":
+        lines.append(f"Поезд: {ex.get('train') or '-'}")
+        lines.append(f"Вагон: {ex.get('carNumber') or '-'}")
+        lines.append(f"Описание: {ex.get('complaintText') or '-'}")
 
-    lines = [
-        f"Заявка: {case.get('caseId')}",
-        f"Тип: {case.get('caseType')}",
-        f"Контакт: {case.get('contactName') or '-'}",
-        f"Чат: {case.get('chatId')} ({case.get('chatType')})",
-    ]
+    if ct == "lost_and_found":
+        lines.append(f"Поезд: {ex.get('train') or '-'}")
+        lines.append(f"Вагон: {ex.get('carNumber') or '-'}")
+        lines.append(f"Место: {ex.get('seat') or '-'}")
+        lines.append(f"Вещь: {ex.get('item') or '-'}")
+        lines.append(f"Когда: {ex.get('when') or '-'}")
 
-    if train:
-        lines.append(f"Поезд: {train}")
-    if wagon:
-        lines.append(f"Вагон: {wagon}")
-    if seat:
-        lines.append(f"Место: {seat}")
+    if ct == "gratitude":
+        lines.append(f"Текст: {ex.get('gratitudeText') or '-'}")
 
-    if case.get("caseType") == "lost_and_found":
-        if item:
-            lines.append(f"Что забыли: {item}")
-
-    if case.get("caseType") == "gratitude":
-        if gt:
-            lines.append(f"Текст благодарности: {gt}")
-
-    if case.get("caseType") in ("complaint", "info"):
-        if details:
-            lines.append(f"Описание: {details}")
-
-    if last_msgs:
-        lines.append("Последние сообщения:")
-        for t in last_msgs:
-            lines.append(f"- {t}")
-
-    if case.get("attachments"):
-        lines.append(f"Вложения: {len(case.get('attachments') or [])}")
+    if ct == "info":
+        lines.append(f"Вопрос: {ex.get('question') or '-'}")
 
     return "\n".join(lines)
 
 
 def format_user_ack(case: Dict[str, Any]) -> str:
-    ctype = case.get("caseType")
-    cid = case.get("caseId")
-
-    if ctype == "complaint":
-        return f"Принял(а) вашу жалобу. Номер заявки: {cid}. Передаю ответственным, спасибо."
-    if ctype == "lost_and_found":
-        return f"Принял(а) информацию по забытым вещам. Номер заявки: {cid}. Мы передали в службу найденных вещей."
-    if ctype == "info":
-        return f"Спасибо! Ваш запрос принят. Номер: {cid}. Мы передали оператору."
-    if ctype == "gratitude":
-        return f"Спасибо! Номер: {cid}. Передадим вашу благодарность 🙏"
-    return f"Спасибо! Номер: {cid}."
+    ct = case.get("caseType")
+    if ct == "complaint":
+        return f"Принял(а) вашу жалобу. Номер заявки: {case['caseId']}."
+    if ct == "lost_and_found":
+        return f"Принял(а) заявку по забытым вещам. Номер заявки: {case['caseId']}."
+    if ct == "gratitude":
+        return "Спасибо за обратную связь! Передадим благодарность команде 🙏"
+    if ct == "info":
+        return f"Принял(а) ваш запрос. Номер: {case['caseId']}."
+    return "Принял(а)."
 
 
-async def close_case(m, case_id: str, status: str = "closed") -> None:
-    await m.cases.update_one(
-        {"caseId": case_id},
-        {"$set": {"status": status, "updatedAt": _now_utc()}},
-    )
+# ----------------------------
+# Combined question for 2 cases
+# ----------------------------
+def build_combined_question(missing_by_type: Dict[str, List[str]]) -> Tuple[str, str]:
+    """
+    Возвращает один человеческий вопрос, чтобы не спамить.
+    И pendingSlot = первый слот, который ждём (упрощение).
+    """
+    # приоритет вопросов: поезд -> вагон -> место -> описание
+    order = ["train", "carNumber", "seat", "complaintText", "item", "when", "gratitudeText", "question"]
+
+    # найдём первый слот в порядке
+    chosen_slot = None
+    chosen_case_type = None
+    for s in order:
+        for ct, miss in missing_by_type.items():
+            if s in miss:
+                chosen_slot = s
+                chosen_case_type = ct
+                break
+        if chosen_slot:
+            break
+
+    if not chosen_slot:
+        return ("Уточните, пожалуйста, детали.", "details")
+
+    # текст вопроса
+    if chosen_slot == "train":
+        return ("Уточните номер поезда (например: Т58).", "train")
+    if chosen_slot == "carNumber":
+        return ("Уточните номер вагона.", "carNumber")
+    if chosen_slot == "seat":
+        return ("Уточните место (например: место 12) — если не помните, напишите «не помню».", "seat")
+    if chosen_slot == "complaintText":
+        return ("Коротко опишите суть жалобы (1–2 предложения).", "complaintText")
+    if chosen_slot == "item":
+        return ("Опишите забытую вещь: что это, цвет/размер, что внутри.", "item")
+    if chosen_slot == "when":
+        return ("Когда примерно оставили/обнаружили пропажу? (дата/время, примерно)", "when")
+    if chosen_slot == "gratitudeText":
+        return ("Кого и за что хотите поблагодарить? (1–2 предложения)", "gratitudeText")
+    if chosen_slot == "question":
+        return ("Уточните, пожалуйста, ваш вопрос.", "question")
+
+    return ("Уточните, пожалуйста, детали.", chosen_slot)
