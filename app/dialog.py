@@ -1,45 +1,42 @@
 from __future__ import annotations
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 from dataclasses import dataclass
 
-from db import MongoStore
-from nlu import build_nlu, extract_train_and_car, extract_car, extract_train, normalize
+from .db import MongoStore
+from .nlu import build_nlu, extract_train_and_car, detect_aggression_and_flood, normalize
 
 
-CaseType = str  # "complaint" | "lost_and_found" | "gratitude"
+CaseType = str  # complaint | lost_and_found | gratitude
 
 
 @dataclass
 class BotReply:
     text: str
-    # for session debug
     asked_slots: List[str]
 
 
 def _ensure_session_defaults(sess: Dict[str, Any]) -> Dict[str, Any]:
     sess.setdefault("shared", {"train": None, "carNumber": None})
     sess.setdefault("pending", {"slots": [], "bundle": None, "caseTypes": []})
-    sess.setdefault("cases", {})  # key: caseType -> caseData
+    sess.setdefault("cases", {})
     sess.setdefault("lastBot", {"text": None, "askedSlots": []})
+    sess.setdefault("moderation", {"tone": "neutral", "angry": False, "flooding": False, "repeat_count": 0, "prev_text": None})
     return sess
 
 
 def _case_defaults(case_type: CaseType) -> Dict[str, Any]:
     return {
         "type": case_type,
-        "status": "collecting",   # collecting | done
+        "status": "collecting",
         "ticketId": None,
         "slots": {
             "train": None,
             "carNumber": None,
-            # complaint
             "complaintText": None,
-            # lost
             "place": None,
             "item": None,
             "itemDetails": None,
             "when": None,
-            # gratitude
             "staffName": None,
             "gratitudeText": None,
         }
@@ -52,7 +49,6 @@ def _required_slots(case_type: CaseType) -> List[str]:
     if case_type == "lost_and_found":
         return ["train", "carNumber", "place", "item", "when"]
     if case_type == "gratitude":
-        # staffName optional (some people don’t know). But gratitudeText required.
         return ["train", "carNumber", "gratitudeText"]
     return []
 
@@ -78,14 +74,7 @@ def _set_shared(shared: Dict[str, Any], train: Optional[str], car: Optional[int]
 
 
 def _parse_lost_bundle(text: str) -> Dict[str, Optional[str]]:
-    """
-    Very simple rule parsing:
-      place: look for "место", "купе", "тамбур", "полка", etc. else take as free text later.
-      item: try to find "сумка/рюкзак/..." else ask.
-      when: try to find "сегодня/вчера/..." or time digits; else ask.
-    """
     t = normalize(text)
-
     place = None
     for key in ["место", "купе", "тамбур", "полка", "у окна", "у двери", "багаж", "верхняя", "нижняя"]:
         if key in t:
@@ -103,23 +92,12 @@ def _parse_lost_bundle(text: str) -> Dict[str, Optional[str]]:
         if key in t:
             when = text.strip()
             break
-    # crude: contains time-like digits "12:30" or "18 00"
+
     import re
-    if not when and re.search(r"\b\d{1,2}[:.]\d{2}\b", text) or re.search(r"\b\d{1,2}\s*(час|ч)\b", t):
+    if not when and (re.search(r"\b\d{1,2}[:.]\d{2}\b", text) or re.search(r"\b\d{1,2}\s*(час|ч)\b", t)):
         when = text.strip()
 
     return {"place": place, "item": item, "when": when}
-
-
-def _parse_staff_name(text: str) -> Optional[str]:
-    """
-    Very light: if user writes 'проводник Иван' / 'Иван' after 'кого' question.
-    We'll just return full text; later you can improve.
-    """
-    tt = text.strip()
-    if len(tt) >= 2:
-        return tt
-    return None
 
 
 class DialogManager:
@@ -127,17 +105,20 @@ class DialogManager:
         self.store = store
 
     def handle(self, chat_id_hash: str, chat_meta: Dict[str, Any], user_text: str) -> BotReply:
-        sess = self.store.get_session(chat_id_hash) or {}
-        sess = _ensure_session_defaults(sess)
-
+        sess = _ensure_session_defaults(self.store.get_session(chat_id_hash) or {})
         pending_slots: List[str] = sess["pending"].get("slots", [])
+
+        # --- moderation update (anti-flood / aggression) ---
+        mod = detect_aggression_and_flood(
+            user_text,
+            prev_text=sess["moderation"].get("prev_text"),
+            repeat_count=int(sess["moderation"].get("repeat_count") or 0),
+        )
+        sess["moderation"].update(mod)
+
         nlu = build_nlu(user_text, pending_slots)
 
-        if nlu.isReset:
-            self.store.reset_session(chat_id_hash)
-            return BotReply("Ок, сбросил диалог. Напишите, что случилось: жалоба / потерял вещь / благодарность.", [])
-
-        # Always store message
+        # store inbound message
         self.store.add_message({
             "chatIdHash": chat_id_hash,
             "chatId": chat_meta.get("chatId"),
@@ -149,90 +130,91 @@ class DialogManager:
             "raw": chat_meta.get("raw"),
         })
 
-        # 1) Greeting only => no case creation
-        if nlu.isGreetingOnly:
-            reply = "Здравствуйте! Напишите, пожалуйста, что именно нужно:\n1) Жалоба\n2) Потерял(а) вещь\n3) Благодарность"
-            sess["lastBot"] = {"text": reply, "askedSlots": []}
+        # --- auto close: cancel/found ---
+        if nlu.isCancel or nlu.isFound:
+            if nlu.isCancel:
+                closed = self.store.close_open_cases(chat_id_hash, None)
+                # also clear local session cases
+                sess["cases"] = {}
+                sess["pending"] = {"slots": [], "bundle": None, "caseTypes": []}
+                txt = "Ок, отменил(а) заявки." if closed > 0 else "Ок, понял(а)."
+                if sess["moderation"].get("angry"):
+                    txt = "Ок. Закрыл(а)." if closed > 0 else "Ок."
+                self._persist(sess, chat_id_hash, chat_meta, txt, [])
+                return BotReply(txt, [])
+
+            # found
+            closed = self.store.close_open_cases(chat_id_hash, "lost_and_found")
+            if "lost_and_found" in sess["cases"]:
+                sess["cases"].pop("lost_and_found", None)
             sess["pending"] = {"slots": [], "bundle": None, "caseTypes": []}
-            self.store.upsert_session(chat_id_hash, sess | {
-                "chatId": chat_meta.get("chatId"),
-                "channelId": chat_meta.get("channelId"),
-                "chatType": chat_meta.get("chatType"),
-            })
-            return BotReply(reply, [])
+            txt = "Отлично! Закрыл(а) заявку по забытым вещам." if closed > 0 else "Отлично! Тогда заявку по забытым вещам не создаю."
+            if sess["moderation"].get("angry"):
+                txt = "Ок. Закрыл(а) по вещам." if closed > 0 else "Ок."
+            self._persist(sess, chat_id_hash, chat_meta, txt, [])
+            return BotReply(txt, [])
 
-        # 2) If message is low-meaning and no pending => ask to clarify (don’t create cases)
+        # reset
+        if nlu.isReset:
+            self.store.reset_session(chat_id_hash)
+            return BotReply("Ок, сбросил диалог. Напишите: жалоба / потерял вещь / благодарность.", [])
+
+        # greeting only (no case)
+        if nlu.isGreetingOnly:
+            txt = "Здравствуйте! Напишите: жалоба / потерял вещь / благодарность."
+            if sess["moderation"].get("angry"):
+                txt = "Напишите: жалоба / потерял / благодарность."
+            self._persist(sess, chat_id_hash, chat_meta, txt, [])
+            return BotReply(txt, [])
+
+        # low meaning and no pending => clarify (но без спора)
         if nlu.meaningScore_0_100 < 30 and not pending_slots:
-            reply = "Не совсем понял. Опишите проблему чуть подробнее или напишите: «жалоба», «потерял вещь», «благодарность»."
-            sess["lastBot"] = {"text": reply, "askedSlots": []}
-            self.store.upsert_session(chat_id_hash, sess | {
-                "chatId": chat_meta.get("chatId"),
-                "channelId": chat_meta.get("channelId"),
-                "chatType": chat_meta.get("chatType"),
-            })
-            return BotReply(reply, [])
+            txt = "Не понял. Напишите: жалоба / потерял вещь / благодарность."
+            if sess["moderation"].get("angry"):
+                txt = "Коротко: жалоба / потерял / благодарность."
+            self._persist(sess, chat_id_hash, chat_meta, txt, [])
+            return BotReply(txt, [])
 
-        # 3) Pending-slots handling: treat short answers as slot answers
+        # pending slots fill
         if pending_slots:
-            filled_any = self._try_fill_pending(sess, user_text)
-            if filled_any:
-                # after filling, continue normal flow to decide next question / closure
+            if self._try_fill_pending(sess, user_text):
                 pass
 
-        # 4) Update shared slots from this message (train/car)
-        _set_shared(sess["shared"], nlu.train, nlu.carNumber)
+        # update shared from msg
+        train, car = extract_train_and_car(user_text)
+        _set_shared(sess["shared"], train, car)
 
-        # 5) Create/activate cases based on intents (multi-intent allowed)
-        # Hard rule: if message contains "благодарность/спасибо" => gratitude case must exist
-        if nlu.intents:
-            for it in nlu.intents:
-                if it not in sess["cases"]:
-                    sess["cases"][it] = _case_defaults(it)
+        # activate cases by intents (multi-intent)
+        for it in nlu.intents:
+            if it not in sess["cases"]:
+                sess["cases"][it] = _case_defaults(it)
 
-        # If user wrote complaint/lost/gratitude text, attach to corresponding case
+        # attach texts
         if "complaint" in sess["cases"] and nlu.complaintText:
-            # But avoid storing just "Т58, 7 вагон" as complaintText if that’s all they said:
-            # If text contains only train/car and very short => treat it as slot answer only.
-            only_train_car = False
-            train, car = extract_train_and_car(user_text)
-            stripped = user_text.strip()
-            if (train or car) and len(stripped) <= 20 and not any(w in normalize(stripped) for w in ["плохо", "опозд", "гряз", "хам", "слом"]):
-                only_train_car = True
-            if not only_train_car:
-                sess["cases"]["complaint"]["slots"]["complaintText"] = user_text.strip()
-
+            sess["cases"]["complaint"]["slots"]["complaintText"] = user_text.strip()
         if "gratitude" in sess["cases"] and nlu.gratitudeText:
             sess["cases"]["gratitude"]["slots"]["gratitudeText"] = user_text.strip()
-
-        # lost: do not auto-fill place/item/when from the first phrase too aggressively,
-        # but we can detect partials.
         if "lost_and_found" in sess["cases"] and nlu.lostHint:
-            # Keep hint as itemDetails if user described it
             if len(nlu.lostHint.strip()) >= 10 and not sess["cases"]["lost_and_found"]["slots"].get("itemDetails"):
                 sess["cases"]["lost_and_found"]["slots"]["itemDetails"] = nlu.lostHint.strip()
 
-        # 6) Apply shared slots into each active case
-        for ct, case in sess["cases"].items():
+        # apply shared
+        for case in sess["cases"].values():
             _apply_shared_into_case(sess["shared"], case)
 
-        # 7) Decide next question (bundles) OR create tickets if ready
         reply = self._next_step(chat_id_hash, sess)
 
-        # persist session
+        self._persist(sess, chat_id_hash, chat_meta, reply.text, reply.asked_slots)
+        return reply
+
+    def _persist(self, sess: Dict[str, Any], chat_id_hash: str, chat_meta: Dict[str, Any], txt: str, asked: List[str]) -> None:
         sess["chatId"] = chat_meta.get("chatId")
         sess["channelId"] = chat_meta.get("channelId")
         sess["chatType"] = chat_meta.get("chatType")
-        sess["lastBot"] = {"text": reply.text, "askedSlots": reply.asked_slots}
+        sess["lastBot"] = {"text": txt, "askedSlots": asked}
         self.store.upsert_session(chat_id_hash, sess)
-        return reply
-
-    # ---------------- internals ----------------
 
     def _try_fill_pending(self, sess: Dict[str, Any], user_text: str) -> bool:
-        """
-        Fill pending bundle slots from user message.
-        Key feature: short "8" fills carNumber if we were waiting for it.
-        """
         slots_to_fill: List[str] = sess["pending"].get("slots", [])
         if not slots_to_fill:
             return False
@@ -240,10 +222,7 @@ class DialogManager:
         text = user_text.strip()
         changed = False
 
-        # Try parse train+car from message
         train, car = extract_train_and_car(text)
-
-        # Fill shared if relevant
         if "train" in slots_to_fill and train and not sess["shared"].get("train"):
             sess["shared"]["train"] = train
             changed = True
@@ -251,8 +230,6 @@ class DialogManager:
             sess["shared"]["carNumber"] = car
             changed = True
 
-        # Fill case-specific pending slots
-        # Determine which cases this pending question was for
         case_types: List[str] = sess["pending"].get("caseTypes", [])
         bundle = sess["pending"].get("bundle")
 
@@ -272,55 +249,41 @@ class DialogManager:
                 set_for_cases("item", parsed["item"])
             if "when" in slots_to_fill and parsed["when"]:
                 set_for_cases("when", parsed["when"])
-            # If user gave long description, treat as itemDetails
             if len(text) >= 10:
                 set_for_cases("itemDetails", text)
-
-        if bundle == "gratitude_bundle":
-            # expecting staffName + gratitudeText maybe
-            if "staffName" in slots_to_fill and len(text) >= 2:
-                set_for_cases("staffName", _parse_staff_name(text))
-            # if they wrote details of gratitude
-            if "gratitudeText" in slots_to_fill and len(text) >= 5:
-                set_for_cases("gratitudeText", text)
 
         if bundle == "complaint_text":
             if "complaintText" in slots_to_fill and len(text) >= 5:
                 set_for_cases("complaintText", text)
 
-        # If something changed, clear pending to avoid re-asking
+        if bundle == "gratitude_bundle":
+            if "gratitudeText" in slots_to_fill and len(text) >= 5:
+                set_for_cases("gratitudeText", text)
+
         if changed:
             sess["pending"] = {"slots": [], "bundle": None, "caseTypes": []}
         return changed
 
     def _next_step(self, chat_id_hash: str, sess: Dict[str, Any]) -> BotReply:
-        # if no cases yet but message has meaning -> ask what they need
-        if not sess["cases"]:
-            return BotReply(
-                "Ок. Это жалоба, потеря вещи или благодарность? Напишите одним словом: «жалоба» / «потерял вещь» / «благодарность».",
-                []
-            )
+        angry = bool(sess["moderation"].get("angry"))
 
-        # 1) First: ensure shared train+car if any open case needs them
+        if not sess["cases"]:
+            txt = "Это жалоба, потеря вещи или благодарность?"
+            if angry:
+                txt = "Жалоба / потерял / благодарность?"
+            return BotReply(txt, [])
+
         needs_train = any("train" in _missing_slots(case) for case in sess["cases"].values())
         needs_car = any("carNumber" in _missing_slots(case) for case in sess["cases"].values())
         if needs_train or needs_car:
-            # Ask bundled once
-            sess["pending"] = {
-                "slots": ["train", "carNumber"],
-                "bundle": "train_car",
-                "caseTypes": list(sess["cases"].keys()),
-            }
-            return BotReply(
-                "Уточните, пожалуйста, номер поезда и номер вагона (можно одним сообщением).\n"
-                "Пример: Т58, 7 вагон",
-                ["train", "carNumber"]
-            )
+            sess["pending"] = {"slots": ["train", "carNumber"], "bundle": "train_car", "caseTypes": list(sess["cases"].keys())}
+            txt = "Укажите поезд и вагон. Пример: Т58, 7."
+            if not angry:
+                txt = "Уточните номер поезда и номер вагона (можно одним сообщением). Пример: Т58, 7 вагон"
+            return BotReply(txt, ["train", "carNumber"])
 
-        # 2) Then: for each case, collect missing slots with bundles
-        # Priority: lost details first (time-sensitive), then complaint, then gratitude
-        order = ["lost_and_found", "complaint", "gratitude"]
-        for ct in order:
+        # priority: lost -> complaint -> gratitude
+        for ct in ["lost_and_found", "complaint", "gratitude"]:
             if ct not in sess["cases"]:
                 continue
             case = sess["cases"][ct]
@@ -328,76 +291,56 @@ class DialogManager:
             if not miss:
                 continue
 
-            # lost bundle: ask place+item+when together
             if ct == "lost_and_found":
-                sess["pending"] = {
-                    "slots": ["place", "item", "when"],
-                    "bundle": "lost_bundle",
-                    "caseTypes": ["lost_and_found"],
-                }
-                return BotReply(
-                    "Понял(а). Чтобы помочь с поиском, напишите одним сообщением:\n"
-                    "1) где примерно оставили в вагоне (место/купе/полка/тамбур)\n"
-                    "2) что за вещь и приметы (цвет/бренд/что внутри)\n"
-                    "3) когда это было (сегодня/вчера/время)\n"
-                    "Пример: «7 вагон, место 12 (верхняя полка), черная сумка Nike, вчера в 18:30»",
-                    ["place", "item", "when"]
-                )
+                sess["pending"] = {"slots": ["place", "item", "when"], "bundle": "lost_bundle", "caseTypes": ["lost_and_found"]}
+                txt = "Где? Что за вещь? Когда?"
+                if not angry:
+                    txt = (
+                        "Напишите одним сообщением:\n"
+                        "1) где в вагоне (место/купе/полка/тамбур)\n"
+                        "2) что за вещь и приметы\n"
+                        "3) когда (сегодня/вчера/время)"
+                    )
+                return BotReply(txt, ["place", "item", "when"])
 
             if ct == "complaint":
                 sess["pending"] = {"slots": ["complaintText"], "bundle": "complaint_text", "caseTypes": ["complaint"]}
-                return BotReply(
-                    "Опишите, пожалуйста, суть жалобы (что произошло). Можно коротко, но по делу.",
-                    ["complaintText"]
-                )
+                txt = "Что произошло? (коротко)"
+                if not angry:
+                    txt = "Опишите, пожалуйста, суть жалобы (что произошло)."
+                return BotReply(txt, ["complaintText"])
 
             if ct == "gratitude":
-                # train+car already collected; now ask who and for what
-                # gratitudeText often contains only "благодарность" => request details
-                if not case["slots"].get("gratitudeText") or normalize(case["slots"]["gratitudeText"]) in {"благодарность", "спасибо", "рахмет"}:
-                    sess["pending"] = {
-                        "slots": ["staffName", "gratitudeText"],
-                        "bundle": "gratitude_bundle",
-                        "caseTypes": ["gratitude"],
-                    }
-                    return BotReply(
-                        "Принял(а) благодарность 🙌 Напишите, пожалуйста:\n"
-                        "1) кого вы хотите поблагодарить (например: проводник, кассир, имя если знаете)\n"
-                        "2) за что именно\n"
-                        "Можно одним сообщением.",
-                        ["staffName", "gratitudeText"]
-                    )
+                # не закрываем — тянем детали
+                sess["pending"] = {"slots": ["gratitudeText"], "bundle": "gratitude_bundle", "caseTypes": ["gratitude"]}
+                txt = "Кого благодарите и за что?"
+                if not angry:
+                    txt = "Принял(а) благодарность 🙌 Кого вы хотите поблагодарить и за что? (можно одним сообщением)"
+                return BotReply(txt, ["gratitudeText"])
 
-        # 3) If all cases complete -> create tickets
-        created_lines = []
+        # create tickets when ready
+        created = []
         for ct, case in sess["cases"].items():
-            miss = _missing_slots(case)
-            if miss:
+            if _missing_slots(case):
                 continue
             if case.get("ticketId"):
                 continue
-
-            payload = {
-                "type": ct,
-                "shared": sess["shared"],
-                "slots": case["slots"],
-            }
+            payload = {"type": ct, "shared": sess["shared"], "slots": case["slots"]}
             ticket_id = self.store.create_case(chat_id_hash, ct, payload)
             case["ticketId"] = ticket_id
             case["status"] = "done"
-            created_lines.append((ct, ticket_id))
+            created.append((ct, ticket_id))
 
-        if created_lines:
-            # Clear pending
+        if created:
             sess["pending"] = {"slots": [], "bundle": None, "caseTypes": []}
-
-            # Nice multi-ticket message
+            if angry:
+                # максимально коротко
+                lines = [f"{tid}" for _, tid in created]
+                return BotReply("Принял(а). Заявки: " + ", ".join(lines), [])
             parts = []
-            for ct, tid in created_lines:
+            for ct, tid in created:
                 label = "Жалоба" if ct == "complaint" else ("Забытые вещи" if ct == "lost_and_found" else "Благодарность")
-                parts.append(f"{label}: номер заявки {tid}")
+                parts.append(f"{label}: {tid}")
+            return BotReply("Принял(а).\n" + "\n".join(parts), [])
 
-            return BotReply("Принял(а). " + "\n".join(parts), [])
-
-        # 4) Nothing new to ask / already done
-        return BotReply("Принял(а). Если хотите добавить детали — просто напишите одним сообщением.", [])
+        return BotReply("Принял(а).", [])
