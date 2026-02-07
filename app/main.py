@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional
 import hashlib
 import logging
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 
 from .settings import settings
@@ -12,7 +12,7 @@ from .db import MongoStore
 from .dialog import DialogManager
 from .wazzup_client import WazzupClient
 
-logger = logging.getLogger("ktzh-bot")
+log = logging.getLogger("ktzh-bot")
 logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(title=settings.APP_NAME)
@@ -24,28 +24,13 @@ wazzup = WazzupClient(settings.WAZZUP_API_KEY)
 
 @app.on_event("startup")
 async def startup():
-    # если у тебя pymongo — connect/close можно сделать no-op в MongoStore
-    if hasattr(store, "connect"):
-        res = store.connect()
-        if callable(res):
-            maybe = res()
-            if hasattr(maybe, "__await__"):
-                await maybe
+    await store.connect()
 
 
 @app.on_event("shutdown")
 async def shutdown():
-    try:
-        await wazzup.close()
-    except Exception:
-        pass
-
-    if hasattr(store, "close"):
-        res = store.close()
-        if callable(res):
-            maybe = res()
-            if hasattr(maybe, "__await__"):
-                await maybe
+    await store.close()
+    await wazzup.close()
 
 
 def chat_hash(chat_id: str) -> str:
@@ -53,73 +38,51 @@ def chat_hash(chat_id: str) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def extract_inbound(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    # statuses callbacks
+    if "statuses" in payload:
+        return None
+
+    # echo from our bot
+    if payload.get("isEcho") is True:
+        return None
+
+    # if direction exists and not inbound
+    direction = payload.get("direction")
+    if direction and direction != "inbound":
+        return None
+
+    # ✅ Wazzup часто кладёт text прямо в корень
+    text = payload.get("text")
+
+    # fallback legacy formats
+    if not text:
+        raw = payload.get("raw") or {}
+        if isinstance(raw, dict):
+            text = raw.get("text")
+    if not text:
+        content = payload.get("content") or {}
+        if isinstance(content, dict):
+            text = content.get("text")
+
+    if not text:
+        return None
+
+    return {
+        "chatId": str(payload.get("chatId") or ""),
+        "channelId": str(payload.get("channelId") or ""),
+        "chatType": str(payload.get("chatType") or "whatsapp"),
+        "dateTime": payload.get("dateTime"),
+        "text": str(text),
+        "raw": payload,
+    }
+
+
 def _check_token(request: Request) -> None:
     if settings.WEBHOOK_TOKEN:
         token = request.query_params.get("token") or request.query_params.get("crmKey")
         if token != settings.WEBHOOK_TOKEN:
             raise HTTPException(status_code=401, detail="Invalid webhook token")
-
-
-def normalize_items(payload: Any) -> List[Dict[str, Any]]:
-    """
-    Wazzup может прислать:
-    - list сообщений
-    - dict с ключами messages/items/data/events
-    - один message dict
-    """
-    if isinstance(payload, list):
-        return [x for x in payload if isinstance(x, dict)]
-
-    if isinstance(payload, dict):
-        for key in ("messages", "items", "data", "events"):
-            v = payload.get(key)
-            if isinstance(v, list):
-                return [x for x in v if isinstance(x, dict)]
-        return [payload]
-
-    return []
-
-
-def extract_inbound(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    # фильтры inbound/echo
-    direction = payload.get("direction")
-    is_echo = payload.get("isEcho")
-    if direction and direction != "inbound":
-        return None
-    if is_echo is True:
-        return None
-
-    # текст может быть в разных местах
-    raw = payload.get("raw") if isinstance(payload.get("raw"), dict) else {}
-    text = raw.get("text")
-
-    if not text and isinstance(payload.get("content"), dict):
-        text = payload["content"].get("text")
-
-    if not text and isinstance(payload.get("message"), dict):
-        text = payload["message"].get("text")
-
-    if not text:
-        text = payload.get("text")
-
-    if not text:
-        return None
-
-    chat_id = payload.get("chatId") or (payload.get("chat") or {}).get("id")
-    channel_id = payload.get("channelId") or (payload.get("channel") or {}).get("id")
-    chat_type = payload.get("chatType") or payload.get("type") or "whatsapp"
-
-    if not chat_id:
-        return None
-
-    return {
-        "chatId": str(chat_id),
-        "channelId": str(channel_id or ""),
-        "chatType": str(chat_type),
-        "dateTime": payload.get("dateTime"),
-        "text": str(text),
-        "raw": payload,
-    }
 
 
 @app.get("/")
@@ -132,41 +95,47 @@ def health():
     return {"ok": True}
 
 
-async def process_items(items: List[Dict[str, Any]]) -> Dict[str, Any]:
-    handled = 0
-    results = []
+async def process_items(items: list) -> None:
+    log.info("WEBHOOK: got %s item(s)", len(items))
 
     for item in items:
         msg = extract_inbound(item)
-        if not msg:
-            logger.info("SKIP: not inbound text payload keys=%s", list(item.keys())[:20])
+        if not msg or not msg["chatId"]:
+            log.info("SKIP: not inbound text payload keys=%s", list(item.keys())[:20])
             continue
 
-        chat_id = msg["chatId"]
-        chat_id_hash = chat_hash(chat_id)
+        chat_id_hash = chat_hash(msg["chatId"])
+        log.info("IN: chatId=%s text=%r", msg["chatId"], msg["text"])
 
-        logger.info("IN: chatId=%s text=%r", chat_id, msg["text"])
+        # ✅ пишем входящее в Mongo
+        await store.add_message({
+            "dir": "in",
+            "chatIdHash": chat_id_hash,
+            "chatId": msg["chatId"],
+            "channelId": msg["channelId"],
+            "chatType": msg["chatType"],
+            "text": msg["text"],
+            "raw": msg["raw"],
+        })
 
         try:
-            bot_reply = dialog.handle(
-    chat_id_hash=chat_id_hash,
-    chat_meta={
-        "chatId": msg["chatId"],
-        "channelId": msg["channelId"],
-        "chatType": msg["chatType"],
-        "dateTime": msg["dateTime"],
-        "raw": msg["raw"],
-    },
-    user_text=msg["text"],
-)
-
+            bot_reply = await dialog.handle(
+                chat_id_hash=chat_id_hash,
+                chat_meta={
+                    "chatId": msg["chatId"],
+                    "channelId": msg["channelId"],
+                    "chatType": msg["chatType"],
+                    "dateTime": msg["dateTime"],
+                    "raw": msg["raw"],
+                },
+                user_text=msg["text"],
+            )
         except Exception as e:
-            logger.exception("Dialog error: %s", e)
-            continue
+            log.exception("Dialog error: %s", e)
+            bot_reply = type("BR", (), {"text": "Извините, произошла ошибка. Попробуйте ещё раз."})()
 
-        logger.info("BOT: reply=%r", bot_reply.text)
+        log.info("BOT: reply=%r", bot_reply.text)
 
-        send_res = {"ok": True, "skipped": True}
         if settings.BOT_SEND_ENABLED:
             send_res = await wazzup.send_message(
                 chat_id=msg["chatId"],
@@ -174,29 +143,32 @@ async def process_items(items: List[Dict[str, Any]]) -> Dict[str, Any]:
                 chat_type=msg["chatType"],
                 text=bot_reply.text,
             )
-            logger.info("SENT: %s", send_res)
+            log.info("SENT: %s", send_res)
 
-        handled += 1
-        results.append({"chatId": msg["chatId"], "reply": bot_reply.text, "send": send_res})
+            # ✅ пишем исходящее в Mongo
+            await store.add_message({
+                "dir": "out",
+                "chatIdHash": chat_id_hash,
+                "chatId": msg["chatId"],
+                "channelId": msg["channelId"],
+                "chatType": msg["chatType"],
+                "text": bot_reply.text,
+                "send": send_res,
+            })
 
-    return {"ok": True, "handled": handled, "results": results}
 
-
-# ✅ Alias для Wazzup
 @app.post("/webhooks")
-async def webhooks_alias(request: Request):
-    return await wazzup_webhook(request)
+async def webhooks_alias(request: Request, background: BackgroundTasks):
+    return await wazzup_webhook(request, background)
 
 
 @app.post("/webhook/wazzup")
-async def wazzup_webhook(request: Request):
+async def wazzup_webhook(request: Request, background: BackgroundTasks):
     _check_token(request)
 
     payload = await request.json()
-    items = normalize_items(payload)
+    items = payload if isinstance(payload, list) else [payload]
 
-    logger.info("WEBHOOK: got %d item(s)", len(items))
-
-    # ВАЖНО: делаем синхронно (надежно). Если хочешь — потом вернём background.
-    res = await process_items(items)
-    return JSONResponse(res)
+    # ✅ async background ok
+    background.add_task(process_items, items)
+    return JSONResponse({"ok": True, "queued": len(items)})
