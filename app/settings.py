@@ -35,6 +35,7 @@ class Settings:
     DB_NAME: str = env_str("MONGO_DB", "ktzh")
     COL_SESSIONS: str = env_str("MONGO_SESSIONS_COLLECTION", "sessions")
     COL_MESSAGES: str = env_str("MONGO_MESSAGES_COLLECTION", "messages")
+    COL_CASES = env_str("COL_CASES", "cases")
 
     # Wazzup
     WAZZUP_API_URL: str = env_str("WAZZUP_API_URL", "https://api.wazzup24.com/v3")
