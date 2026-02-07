@@ -10,9 +10,6 @@ def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
-# ----------------------------
-# regex / extraction
-# ----------------------------
 TRAIN_RE = re.compile(r"\b[тt]\s*-?\s*(\d{1,4})\b", re.IGNORECASE)
 CAR_RE_1 = re.compile(r"\bвагон\s*(\d{1,2})\b", re.IGNORECASE)
 CAR_RE_2 = re.compile(r"\b(\d{1,2})\s*вагон\b", re.IGNORECASE)
@@ -23,11 +20,6 @@ DATE_RE = re.compile(r"\b\d{1,2}[./-]\d{1,2}([./-]\d{2,4})?\b")
 TIME_RE = re.compile(r"\b([01]?\d|2[0-3])[:.][0-5]\d\b")
 AGO_RE = re.compile(r"\b(\d{1,2})\s*(час(а|ов)?|мин(ут(а|ы)?)?)\s*назад\b", re.IGNORECASE)
 REL_TIME_WORDS = ["сегодня", "вчера", "позавчера", "утром", "вечером", "ночью", "днем"]
-
-STAFF_RE = re.compile(
-    r"\b(проводник|кондуктор|кассир|стюард|начальник\s+поезда)\b\s*([А-ЯA-ZЁӘІҢҒҮҰҚӨҺ][а-яa-zёәіңғүұқөһ-]{1,40})?",
-    re.IGNORECASE
-)
 
 ITEM_AFTER_VERB_RE = re.compile(r"\b(забыл|оставил|потерял|утерял)\b\s+(.+)$", re.IGNORECASE)
 
@@ -48,7 +40,6 @@ def _first_int(text: str) -> Optional[int]:
 
 def _extract_when_hint(text: str) -> Optional[str]:
     t = (text or "").lower()
-
     d = DATE_RE.search(t)
     tm = TIME_RE.search(t)
     ago = AGO_RE.search(t)
@@ -90,12 +81,6 @@ def extract_entities(text: str) -> Dict[str, Any]:
     ms = SEAT_RE_1.search(t) or SEAT_RE_2.search(t)
     if ms:
         out["seat"] = ms.group(1).upper()
-
-    msf = STAFF_RE.search(t)
-    if msf:
-        out["staffRole"] = msf.group(1).lower()
-        if msf.group(2):
-            out["staffName"] = msf.group(2).strip()
 
     return out
 
@@ -228,13 +213,6 @@ async def create_case(
     return doc
 
 
-def _gratitude_needs_train_car(ex: Dict[str, Any]) -> bool:
-    txt = (ex.get("gratitudeText") or "").lower()
-    if ex.get("staffRole") or ex.get("staffName"):
-        return True
-    return any(w in txt for w in ("проводник", "кондуктор", "кассир", "начальник поезда", "стюард"))
-
-
 def required_slots(case: Dict[str, Any]) -> List[str]:
     ct = case.get("caseType")
     ex = case.get("extracted") or {}
@@ -263,12 +241,6 @@ def required_slots(case: Dict[str, Any]) -> List[str]:
     elif ct == "gratitude":
         if not ex.get("gratitudeText"):
             missing.append("gratitudeText")
-        else:
-            if _gratitude_needs_train_car(ex):
-                if not ex.get("train"):
-                    missing.append("train")
-                if not ex.get("carNumber"):
-                    missing.append("carNumber")
 
     elif ct == "info":
         if not ex.get("question"):
@@ -302,31 +274,27 @@ def build_question(case: Dict[str, Any], slot: str) -> Tuple[str, str]:
             return (pref + "Коротко опишите, что случилось (1–2 предложения).", "complaintText")
 
     if ct == "lost_and_found":
-        if slot == "train":
-            return (pref + "Уточните номер поезда (например: Т58). Если знаете — сразу напишите и вагон.", "train")
-        if slot == "carNumber":
-            return (pref + "Уточните номер вагона, где оставили вещь.", "carNumber")
-
-        # БАНДЛ
+        # после intake, если всё равно не хватает — бандл
         if slot in ("seat", "item", "when"):
             q = (
                 pref
-                + "Чтобы помочь найти вещь, напишите ОДНИМ сообщением:\n"
+                + "Чтобы помочь найти вещь, напишите одним сообщением:\n"
                   "1) место (если помните)\n"
                   "2) что за вещь и приметы (цвет/бренд/что внутри)\n"
                   "3) когда примерно оставили\n\n"
-                  "Пример: «12, черная сумка Adidas, вчера 19:30».\n"
+                  "Пример: «место 12, черная сумка Adidas, вчера 19:30».\n"
                   "Если место не помните — «место не помню»."
             )
             return (q, "lf_bundle")
 
+        if slot == "train":
+            return (pref + "Уточните номер поезда (например: Т58). Можно сразу: «Т58, вагон 7».", "train")
+        if slot == "carNumber":
+            return (pref + "Уточните номер вагона, где оставили вещь.", "carNumber")
+
     if ct == "gratitude":
         if slot == "gratitudeText":
             return ("Спасибо! Кого и за что хотите поблагодарить? (1–2 предложения)", "gratitudeText")
-        if slot == "train":
-            return ("Чтобы передать благодарность нужной бригаде, уточните номер поезда (например: Т58). Можно сразу и вагон.", "train")
-        if slot == "carNumber":
-            return ("Уточните, пожалуйста, номер вагона (например: вагон 4).", "carNumber")
 
     if ct == "info":
         if slot == "question":
@@ -350,13 +318,6 @@ def _allow_pending(sess: Optional[Dict[str, Any]], case_type: str) -> bool:
 
 
 def _parse_lf_bundle(text: str) -> Dict[str, Any]:
-    """
-    Умеет:
-    - "12, черная сумка, вчера 19:30"
-    - "место 12 сумка adidas вчера"
-    - "12 сумка adidas"
-    - "место не помню, черный рюкзак, сегодня"
-    """
     t = (text or "").strip()
     low = t.lower()
     out: Dict[str, Any] = {}
@@ -364,24 +325,18 @@ def _parse_lf_bundle(text: str) -> Dict[str, Any]:
     if not t:
         return out
 
-    # seat unknown
-    if "место" in low and ("не помню" in low or "не знаю" in low):
+    if ("место" in low and ("не помню" in low or "не знаю" in low)) or low.strip() in ("не помню", "не знаю"):
         out["seat"] = "UNKNOWN"
 
-    # сегментация по запятым/точкам с запятой
     parts = [p.strip() for p in re.split(r"[;,]+", t) if p.strip()]
     if not parts:
         parts = [t]
-
-    item_chunks: List[str] = []
-    when_hint = _extract_when_hint(t)
 
     # seat
     ms = SEAT_RE_1.search(t) or SEAT_RE_2.search(t)
     if ms:
         out["seat"] = ms.group(1).upper()
     else:
-        # если первая часть начинается с числа, и это не "вагон/поезд"
         first = parts[0]
         if first and first[:3].strip().isdigit() and ("вагон" not in first.lower()) and (TRAIN_RE.search(first) is None):
             n = _first_int(first)
@@ -389,11 +344,11 @@ def _parse_lf_bundle(text: str) -> Dict[str, Any]:
                 out["seat"] = str(n)
 
     # when
-    if when_hint:
-        out["when"] = when_hint
+    wh = _extract_when_hint(t)
+    if wh:
+        out["when"] = wh
 
     # item
-    # 1) если есть "забыл/оставил X" — возьмём X
     mi = ITEM_AFTER_VERB_RE.search(t)
     if mi:
         cand = _strip_noise(mi.group(2))
@@ -401,7 +356,7 @@ def _parse_lf_bundle(text: str) -> Dict[str, Any]:
             out["item"] = cand
             return out
 
-    # 2) иначе составим item из сегментов, которые не похожи на when/seat
+    item_chunks: List[str] = []
     for p in parts:
         pl = p.lower()
         if pl in FILLER_REPLIES:
@@ -410,27 +365,23 @@ def _parse_lf_bundle(text: str) -> Dict[str, Any]:
             continue
         if "место" in pl:
             continue
-        # если сегмент только цифра — скорее место
         if p.isdigit() and "seat" not in out:
             continue
         item_chunks.append(p)
 
     cand2 = _strip_noise(" ".join(item_chunks))
-    if cand2 and cand2.lower() not in FILLER_REPLIES:
-        # чуть-чуть фильтрация: не записывать "не помню" как item
-        if cand2.lower() not in ("не помню", "не знаю"):
-            out["item"] = cand2
+    if cand2 and cand2.lower() not in FILLER_REPLIES and cand2.lower() not in ("не помню", "не знаю"):
+        out["item"] = cand2
 
     return out
 
 
 def _apply_pending_overrides(text: str, pending_slot: Optional[str]) -> Dict[str, Any]:
     t = (text or "").strip()
-    out: Dict[str, Any] = {}
     if not pending_slot or not t:
-        return out
+        return {}
 
-    low = t.lower().strip()
+    out: Dict[str, Any] = {}
 
     if pending_slot == "carNumber":
         n = _first_int(t)
@@ -444,7 +395,6 @@ def _apply_pending_overrides(text: str, pending_slot: Optional[str]) -> Dict[str
             out["train"] = f"T{mt.group(1)}".upper()
         return out
 
-    # общий поезд+вагон
     if pending_slot == "train_car":
         mt = TRAIN_RE.search(t)
         if mt:
@@ -452,47 +402,46 @@ def _apply_pending_overrides(text: str, pending_slot: Optional[str]) -> Dict[str
         mc = CAR_RE_1.search(t) or CAR_RE_2.search(t)
         if mc:
             out["carNumber"] = int(mc.group(1))
-            return out
-
-        # если "Т58, 7" — возьмем второй номер как вагон
-        nums = re.findall(r"\d{1,4}", t)
-        if mt and len(nums) >= 2:
-            train_num = mt.group(1)
-            for x in nums:
-                if x != train_num:
-                    try:
-                        n = int(x)
-                        if 1 <= n <= 99:
-                            out["carNumber"] = n
-                            break
-                    except Exception:
-                        pass
+        else:
+            # "Т58, 7"
+            nums = re.findall(r"\d{1,4}", t)
+            if mt and len(nums) >= 2:
+                train_num = mt.group(1)
+                for x in nums:
+                    if x != train_num:
+                        try:
+                            n = int(x)
+                            if 1 <= n <= 99:
+                                out["carNumber"] = n
+                                break
+                        except Exception:
+                            pass
         return out
 
     if pending_slot == "lf_bundle":
         return _parse_lf_bundle(t)
 
-    if pending_slot == "seat":
-        if "не помню" in low or "не знаю" in low:
-            out["seat"] = "UNKNOWN"
-            return out
-        ms = SEAT_RE_1.search(t) or SEAT_RE_2.search(t)
-        if ms:
-            out["seat"] = ms.group(1).upper()
-        else:
-            if t.isdigit():
-                out["seat"] = t
-            else:
-                out["seat"] = t.upper()
+    # ✅ универсальный intake: поезд+вагон+место+вещь+когда одним сообщением
+    if pending_slot == "lf_intake":
+        out.update(_apply_pending_overrides(t, "train_car"))
+        out.update(_parse_lf_bundle(t))
+        # если item не вытащился, но есть "потерял/забыл/оставил ..." — возьмем хвост
+        if "item" not in out:
+            mi = ITEM_AFTER_VERB_RE.search(t)
+            if mi:
+                cand = _strip_noise(mi.group(2))
+                if cand:
+                    out["item"] = cand
         return out
 
     if pending_slot in ("complaintText", "gratitudeText", "item", "when", "question"):
+        low = t.lower().strip()
         if low in FILLER_REPLIES:
             return {}
         out[pending_slot] = t
         return out
 
-    return out
+    return {}
 
 
 async def update_case_with_message(
@@ -510,10 +459,15 @@ async def update_case_with_message(
     ent = extract_entities(text)
 
     pending_slot = (sess or {}).get("pendingSlot")
-    if _allow_pending(sess, case.get("caseType", "")):
-        ent.update(_apply_pending_overrides(text, pending_slot))
+    used_pending = False
 
-    # shared fields
+    if _allow_pending(sess, case.get("caseType", "")):
+        extra = _apply_pending_overrides(text, pending_slot)
+        if extra:
+            ent.update(extra)
+            used_pending = True
+
+    # shared
     if ent.get("train"):
         ex["train"] = ent["train"]
     if ent.get("carNumber") is not None:
@@ -525,7 +479,6 @@ async def update_case_with_message(
         if ent.get("complaintText"):
             ex["complaintText"] = ent["complaintText"]
         else:
-            # смысловой текст — берём как complaintText
             if text and not text.isdigit() and low not in FILLER_REPLIES and len(text) >= 8:
                 ex.setdefault("complaintText", text)
 
@@ -537,7 +490,6 @@ async def update_case_with_message(
         if ent.get("when"):
             ex["when"] = ent["when"]
 
-        # если человек пишет "забыл/оставил ..." и item ещё пустой
         if not ex.get("item") and text:
             mi = ITEM_AFTER_VERB_RE.search(text)
             if mi:
@@ -551,17 +503,11 @@ async def update_case_with_message(
                 ex["when"] = wh
 
     elif ct == "gratitude":
-        if ent.get("staffRole"):
-            ex["staffRole"] = ent["staffRole"]
-        if ent.get("staffName"):
-            ex["staffName"] = ent["staffName"]
-
-        # одно слово "благодарность" — НЕ принимаем как готовый текст
-        if low in ("благодарность", "спасибо", "рахмет"):
-            pass
+        if ent.get("gratitudeText"):
+            ex["gratitudeText"] = ent["gratitudeText"]
         else:
-            if ent.get("gratitudeText"):
-                ex["gratitudeText"] = ent["gratitudeText"]
+            if low in ("благодарность", "спасибо", "рахмет"):
+                pass
             elif len(text) >= 10 and low not in FILLER_REPLIES:
                 ex["gratitudeText"] = text
 
@@ -572,7 +518,6 @@ async def update_case_with_message(
             if len(text) >= 5 and low not in FILLER_REPLIES:
                 ex["question"] = text
 
-    # evidence + attachments
     evidence = case.get("evidence") or []
     if text:
         evidence.append({"at": now, "text": text, "messageId": msg_doc.get("messageId")})
@@ -591,6 +536,10 @@ async def update_case_with_message(
             "updatedAt": now,
         }},
     )
+
+    # ✅ если мы реально обработали pending — чистим его, чтобы не было “повторите вагон…”
+    if used_pending and case.get("channelId") and case.get("chatId"):
+        await set_pending(m, case["channelId"], case["chatId"], None, None, None, None)
 
     updated = await m.cases.find_one({"caseId": case["caseId"]})
     return updated or case
@@ -618,13 +567,7 @@ def format_dispatch_text(case: Dict[str, Any]) -> str:
         ]
 
     if ct == "gratitude":
-        staff = (ex.get("staffRole") or "-") + ((" " + ex.get("staffName")) if ex.get("staffName") else "")
-        lines += [
-            f"Поезд: {ex.get('train') or '-'}",
-            f"Вагон: {ex.get('carNumber') or '-'}",
-            f"Сотрудник: {staff.strip()}",
-            f"Текст: {ex.get('gratitudeText') or '-'}",
-        ]
+        lines.append(f"Текст: {ex.get('gratitudeText') or '-'}")
 
     if ct == "info":
         lines.append(f"Вопрос: {ex.get('question') or '-'}")
