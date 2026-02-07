@@ -8,14 +8,16 @@ from .settings import settings
 class WazzupClient:
     def __init__(self, api_key: str):
         self.api_key = api_key
-        self.base_url = settings.WAZZUP_API_URL.rstrip("/")
         self._client = httpx.AsyncClient(timeout=10.0)
+
+    async def close(self) -> None:
+        await self._client.aclose()
 
     async def send_message(self, chat_id: str, channel_id: str, chat_type: str, text: str) -> Dict[str, Any]:
         if not self.api_key:
             return {"ok": False, "error": "WAZZUP_API_KEY is empty"}
 
-        url = f"{self.base_url}/message"
+        url = f"{settings.WAZZUP_API_URL.rstrip('/')}/message"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -27,11 +29,7 @@ class WazzupClient:
             "text": text,
         }
 
-        try:
-            r = await self._client.post(url, json=payload, headers=headers)
-        except Exception as e:
-            return {"ok": False, "error": f"http_error: {e.__class__.__name__}: {e}"}
-
+        r = await self._client.post(url, json=payload, headers=headers)
         try:
             data = r.json()
         except Exception:
@@ -41,6 +39,3 @@ class WazzupClient:
             return {"ok": False, "status": r.status_code, "response": data}
 
         return {"ok": True, "status": r.status_code, "response": data}
-
-    async def close(self):
-        await self._client.aclose()
