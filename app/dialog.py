@@ -6,6 +6,7 @@ from .db import MongoStore
 from .nlu import build_nlu, extract_train_and_car, detect_aggression_and_flood, normalize
 
 
+
 CaseType = str  # complaint | lost_and_found | gratitude
 
 
