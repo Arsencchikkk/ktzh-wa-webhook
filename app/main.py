@@ -97,13 +97,13 @@ async def _send_text(channel_id: str, chat_type: str, chat_id: str, text: str, c
 # scoring / intent
 # ----------------------------
 GREET_WORDS = ["здравствуйте", "привет", "салам", "сәлем", "добрый", "ассалам"]
-THANK_WORDS = ["спасибо", "рахмет", "благодар", "алғыс"]
-LOST_WORDS = ["забыл", "оставил", "потерял", "утерял", "вещ", "сумк", "рюкзак", "кошел", "паспорт", "телефон", "наушник"]
+THANK_WORDS = ["спасибо", "рахмет", "благодар", "алғыс","молодец","чист","уютн","комфорт"]
+LOST_WORDS = ["забыл", "оставил", "потерял", "утерял", "вещ", "потерял"]
 COMPLAINT_WORDS = [
     "жалоб", "плох", "ужас", "хам", "опозд", "задерж", "гряз", "вон", "холод", "жарк",
-    "не работает", "сломал", "нет бумаги", "нет воды", "санитар", "шум", "течет"
+    "не работает", "сломал", "нет бумаги", "нет воды", "санитар", "шум", "течет","отсуствует"
 ]
-STAFF_WORDS = ["проводник", "кондуктор", "кассир", "стюард", "начальник поезда"]
+STAFF_WORDS = ["проводник", "кондуктор", "кассир", "стюард", "начальник поезда","сотрудник]
 
 
 def _has_any(text: str, words: List[str]) -> bool:
@@ -134,18 +134,24 @@ def _meaning_score(text: str) -> int:
 
 
 def _intent_scores(text: str, nlu_intent: str) -> Dict[str, int]:
-    t = (text or "").lower()
+    t_raw = (text or "").strip()
+    t = t_raw.lower()
 
-    greet = 2 if _has_any(t, GREET_WORDS) else 0
-    grat = 2 if _has_any(t, THANK_WORDS) else 0
-    lost = 3 if _has_any(t, LOST_WORDS) else 0
-    complaint = 3 if _has_any(t, COMPLAINT_WORDS) else 0
+    has_greet = _has_any(t, GREET_WORDS)
+    has_grat = _has_any(t, THANK_WORDS) or t in ("благодарность", "алғыс", "рахмет", "спасибо")
+    has_lost = _has_any(t, LOST_WORDS)
+    has_complaint = _has_any(t, COMPLAINT_WORDS)
 
-    if greet and _meaning_score(text) == 0 and not (lost or complaint or grat):
-        greet += 2
+    greet = 2 if has_greet else 0
+    grat = 2 if has_grat else 0
+    lost = 3 if has_lost else 0
+    complaint = 3 if has_complaint else 0
+
+    # greeting + (complaint/lost/grat) => это не greeting
     if greet and (lost or complaint or grat):
         greet = 0
 
+    # NLU boosts (но ниже будет hard-override)
     if nlu_intent == "complaint":
         complaint += 2
     if nlu_intent == "lost_and_found":
@@ -155,27 +161,51 @@ def _intent_scores(text: str, nlu_intent: str) -> Dict[str, int]:
     if nlu_intent == "greeting":
         greet += 1
 
+ 
+    if has_grat and not has_complaint and not has_lost:
+        grat = max(grat, 6)
+        complaint = 0
+        lost = 0
+        greet = 0
+
+    # Если это чистое приветствие (смысла 0) — НЕ создаём кейс
+    if has_greet and _meaning_score(t_raw) == 0 and not (has_grat or has_lost or has_complaint):
+        greet = max(greet, 6)
+        grat = 0
+        lost = 0
+        complaint = 0
+
+    # усиление благодарности если упомянут сотрудник
     if grat and _has_any(t, STAFF_WORDS):
         grat += 1
 
     return {"greet": greet, "gratitude": grat, "lost_and_found": lost, "complaint": complaint}
 
 
+
 def _choose_case_types(text: str, nlu_intent: str, active_types: Optional[Set[str]] = None) -> List[str]:
     scores = _intent_scores(text, nlu_intent)
     active_types = active_types or set()
 
-    if scores["greet"] >= 3 and scores["complaint"] == 0 and scores["lost_and_found"] == 0 and scores["gratitude"] == 0:
+    # greeting only
+    if scores["greet"] >= 5 and scores["complaint"] == 0 and scores["lost_and_found"] == 0 and scores["gratitude"] == 0:
         return ["greeting"]
+
+ 
+    if scores["gratitude"] >= 5 and scores["complaint"] < 3 and scores["lost_and_found"] < 3:
+        return ["gratitude"]
 
     picks: List[str] = []
     if scores["complaint"] >= 3:
         picks.append("complaint")
     if scores["lost_and_found"] >= 3:
         picks.append("lost_and_found")
-    if scores["gratitude"] >= 3 and not picks:
+
+    # gratitude — только если нет complaint/lost
+    if not picks and scores["gratitude"] >= 3:
         picks.append("gratitude")
 
+    # если нет picks, но есть активный контекст — продолжаем его
     if not picks and active_types:
         if "complaint" in active_types:
             return ["complaint"]
@@ -191,6 +221,7 @@ def _choose_case_types(text: str, nlu_intent: str, active_types: Optional[Set[st
             picks.append("other")
 
     return picks
+
 
 
 # ----------------------------
