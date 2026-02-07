@@ -31,11 +31,11 @@ class Settings:
     APP_NAME: str = env_str("APP_NAME", "KTZH Smart Bot")
 
     # Mongo
-    MONGODB_URI: str = env_str("MONGO_URI", "mongodb+srv://barsen1506:arsen123@cluster0.ts1nh.mongodb.net/ktzh?retryWrites=true&w=majority")
+    MONGODB_URI: str = env_str("MONGO_URI", "")
     DB_NAME: str = env_str("MONGO_DB", "ktzh")
     COL_SESSIONS: str = env_str("MONGO_SESSIONS_COLLECTION", "sessions")
     COL_MESSAGES: str = env_str("MONGO_MESSAGES_COLLECTION", "messages")
-    COL_CASES = env_str("COL_CASES", "cases")
+    COL_CASES: str = env_str("MONGO_CASES_COLLECTION", "cases")
 
     # Wazzup
     WAZZUP_API_URL: str = env_str("WAZZUP_API_URL", "https://api.wazzup24.com/v3")
@@ -53,13 +53,6 @@ class Settings:
     MAX_HISTORY: int = env_int("MAX_HISTORY", 20)
     FLOOD_WINDOW_SEC: int = env_int("FLOOD_WINDOW_SEC", 8)
     FLOOD_MAX_MSG: int = env_int("FLOOD_MAX_MSG", 4)
-
-    # Optional LLM (off by default)
-    LLM_ENABLED: bool = env_bool("LLM_ENABLED", False)
-    OPENAI_API_KEY: str = env_str("OPENAI_API_KEY", "")
-    LLM_MODEL: str = env_str("LLM_MODEL", "gpt-4o-mini")
-    LLM_TIMEOUT_SEC: int = env_int("LLM_TIMEOUT_SEC", 6)
-    LLM_STORE: bool = env_bool("LLM_STORE", False)
 
 
 settings = Settings()
