@@ -5,8 +5,11 @@ from typing import Any, Dict, List, Optional, Tuple
 import datetime as dt
 import re
 import secrets
+import logging
 
 from .nlu import build_nlu, extract_train_and_car, detect_aggression_and_flood, normalize
+
+log = logging.getLogger("ktzh")
 
 
 @dataclass
@@ -66,7 +69,7 @@ def _extract_train_car_any(text: str) -> Tuple[Optional[str], Optional[int]]:
 
 def _is_train_car_only(text: str) -> bool:
     tn = normalize(text)
-    tr, car = _extract_train_car_any(text)  # ✅ ВАЖНО: сюда оригинал, не tn
+    tr, car = _extract_train_car_any(text)  # ✅ оригинал, не tn
     tokens = re.findall(r"[a-zа-я0-9/]+", tn)
     if not tokens:
         return False
@@ -116,7 +119,6 @@ def _extract_place(text: str) -> Optional[str]:
     if "ниж" in t and "полк" in t:
         return "нижняя полка"
 
-    # ✅ если указали и купе, и место — склеиваем
     if coupe and seat:
         return f"купе {coupe}, место {seat}"
     if seat:
@@ -125,7 +127,6 @@ def _extract_place(text: str) -> Optional[str]:
         return f"купе {coupe}"
 
     return None
-
 
 
 def _extract_when(text: str) -> Optional[str]:
@@ -151,8 +152,39 @@ def _extract_when(text: str) -> Optional[str]:
 
 def _extract_item(text: str) -> Optional[str]:
     tn = normalize(text)
-    keys = ("сумк", "рюкзак", "чемодан", "пакет", "телефон", "документ", "паспорт", "кошелек", "бумажник", "наушник", "ноутбук")
+    keys = (
+        "сумк", "рюкзак", "чемодан", "пакет",
+        "телефон", "документ", "паспорт",
+        "кошелек", "бумажник", "наушник", "ноутбук",
+        # ✅ одежда и частые вещи
+        "кофт", "куртк", "одежд", "футболк", "штан", "джинс", "пальт", "шапк",
+    )
     return _short(text) if any(k in tn for k in keys) else None
+
+
+def _split_123(text: str) -> Dict[str, str]:
+    """
+    Парсим форматы:
+      1) ...
+      2) ...
+      3) ...
+    """
+    s = (text or "").strip()
+    out: Dict[str, str] = {}
+
+    m1 = re.search(r"(?:^|\s)1\)\s*(.+?)(?=(?:\s*\b2\)\b|\s*$))", s, flags=re.S)
+    if m1:
+        out["1"] = m1.group(1).strip()
+
+    m2 = re.search(r"(?:^|\s)2\)\s*(.+?)(?=(?:\s*\b3\)\b|\s*$))", s, flags=re.S)
+    if m2:
+        out["2"] = m2.group(1).strip()
+
+    m3 = re.search(r"(?:^|\s)3\)\s*(.+?)\s*$", s, flags=re.S)
+    if m3:
+        out["3"] = m3.group(1).strip()
+
+    return out
 
 
 def _required_slots(case_type: str) -> List[str]:
@@ -274,7 +306,6 @@ class DialogManager:
     def _set_pending(self, session: Dict[str, Any], scope: str, slots: List[str], case_type: Optional[str] = None) -> None:
         session["pending"] = {"scope": scope, "slots": slots, "caseType": case_type}
 
-    # ✅ спрашиваем только то, чего не хватает
     def _train_car_question_for(self, case_type: str, missing_train: bool, missing_car: bool) -> str:
         prefix = {
             "complaint": "Чтобы оформить жалобу",
@@ -301,6 +332,23 @@ class DialogManager:
     def _is_case_ready(self, session: Dict[str, Any], case: Dict[str, Any]) -> bool:
         shared = session["shared"]
         cs = case["slots"]
+
+        # поезд+вагон всегда обязательны
+        if not shared.get("train") or not shared.get("car"):
+            return False
+
+        # ✅ LOST: если есть минимум 2 из 3 — оформляем (как ты просил)
+        if case["type"] == "lost":
+            filled = 0
+            if cs.get("place"):
+                filled += 1
+            if cs.get("item"):
+                filled += 1
+            if cs.get("when"):
+                filled += 1
+            return filled >= 2
+
+        # остальное — строго
         for s in _required_slots(case["type"]):
             if s == "train" and not shared.get("train"):
                 return False
@@ -340,7 +388,6 @@ class DialogManager:
 
         train, car = _extract_train_car_any(text)
         shared = session["shared"]
-
         changed = False
 
         if scope == "shared":
@@ -366,12 +413,40 @@ class DialogManager:
             if ok:
                 session["pending"] = None
                 if changed:
-                    self._loop_reset(session)  # ✅ прогресс есть — сбрасываем цикл
+                    self._loop_reset(session)
 
         if scope == "case" and case_type:
             case = self._get_or_create_case(session, case_type)
             cs = case["slots"]
 
+            parts = _split_123(text)
+
+            # ✅ LOST: если пришло "1) 2) 3)" — берём прямо оттуда
+            if case_type == "lost" and parts:
+                p1 = parts.get("1", "")
+                p2 = parts.get("2", "")
+                p3 = parts.get("3", "")
+
+                if "place" in slots and not cs.get("place"):
+                    pl = _extract_place(p1) or _extract_place(text)
+                    if pl:
+                        cs["place"] = pl
+                        changed = True
+
+                if "item" in slots and not cs.get("item"):
+                    # ✅ item берём как есть из блока 2) — без ключевых слов
+                    it = _short(p2) if p2 else (_extract_item(text) or None)
+                    if it:
+                        cs["item"] = it
+                        changed = True
+
+                if "when" in slots and not cs.get("when"):
+                    wh = _extract_when(p3) or _extract_when(text)
+                    if wh:
+                        cs["when"] = wh
+                        changed = True
+
+            # обычные случаи / fallback
             if "place" in slots and not cs.get("place"):
                 pl = _extract_place(text)
                 if pl:
@@ -411,7 +486,7 @@ class DialogManager:
             if ok:
                 session["pending"] = None
                 if changed:
-                    self._loop_reset(session)  # ✅ прогресс есть — сбрасываем цикл
+                    self._loop_reset(session)
 
     async def handle(self, chat_id_hash: str, chat_meta: Dict[str, Any], user_text: str) -> BotReply:
         session = await self._load_session(chat_id_hash)
@@ -423,7 +498,6 @@ class DialogManager:
         text = user_text or ""
         tnorm = normalize(text)
 
-        # cancel
         if tnorm in {"стоп", "хватит", "отмена", "прекрати", "прекратите"}:
             self._close_all_cases(session, reason="user_cancel")
             self._reset_dialog(session)
@@ -442,7 +516,6 @@ class DialogManager:
         if session.get("pending"):
             self._apply_pending(session, text)
 
-        # greeting only
         if getattr(nlu_res, "greeting_only", False) and not session.get("cases"):
             await self._save_session(chat_id_hash, session)
             return BotReply(text="Здравствуйте! Опишите проблему одним сообщением (опоздание / забытая вещь / жалоба / благодарность).")
@@ -452,7 +525,6 @@ class DialogManager:
         shared = session["shared"]
         slots = getattr(nlu_res, "slots", {}) or {}
 
-        # apply NLU slots
         if slots.get("train") and not shared.get("train"):
             shared["train"] = slots["train"]
             self._loop_reset(session)
@@ -460,7 +532,6 @@ class DialogManager:
             shared["car"] = slots["car"]
             self._loop_reset(session)
 
-        # apply regex slots
         tr, car = _extract_train_car_any(text)
         if tr and not shared.get("train"):
             shared["train"] = tr
@@ -469,11 +540,9 @@ class DialogManager:
             shared["car"] = car
             self._loop_reset(session)
 
-        # create cases
         for it in intents:
             self._get_or_create_case(session, it)
 
-        # fill case texts
         if "complaint" in intents:
             ccase = self._get_or_create_case(session, "complaint")
             if not ccase["slots"].get("complaintText"):
@@ -490,29 +559,45 @@ class DialogManager:
 
         if "lost" in intents:
             lcase = self._get_or_create_case(session, "lost")
-            if not lcase["slots"].get("place"):
-                lcase["slots"]["place"] = _extract_place(text)
-            if not lcase["slots"].get("item"):
-                lcase["slots"]["item"] = _extract_item(text)
-            if not lcase["slots"].get("when"):
-                lcase["slots"]["when"] = _extract_when(text)
 
-        # primary
+            parts = _split_123(text)
+            if parts:
+                # ✅ если клиент дал 1)/2)/3) — сразу кладём
+                p1 = parts.get("1", "")
+                p2 = parts.get("2", "")
+                p3 = parts.get("3", "")
+
+                if not lcase["slots"].get("place"):
+                    lcase["slots"]["place"] = _extract_place(p1) or _extract_place(text)
+                if not lcase["slots"].get("item"):
+                    lcase["slots"]["item"] = _short(p2) if p2 else (_extract_item(text) or None)
+                if not lcase["slots"].get("when"):
+                    lcase["slots"]["when"] = _extract_when(p3) or _extract_when(text)
+            else:
+                if not lcase["slots"].get("place"):
+                    lcase["slots"]["place"] = _extract_place(text)
+                if not lcase["slots"].get("item"):
+                    lcase["slots"]["item"] = _extract_item(text)
+                if not lcase["slots"].get("when"):
+                    lcase["slots"]["when"] = _extract_when(text)
+
         primary: Optional[str] = None
         for ct in ["lost", "complaint", "gratitude"]:
             if any(c["type"] == ct and c["status"] in ("open", "collecting") for c in session["cases"]):
                 primary = ct
                 break
 
-        # ===== ask train/car with anti-loop + ask only missing =====
         if primary:
             missing_train = not bool(shared.get("train"))
             missing_car = not bool(shared.get("car"))
 
             if missing_train or missing_car:
                 cnt = self._loop_bump(session, "ask_train_car")
-                self._set_pending(session, scope="shared",
-                                  slots=[s for s in ["train", "car"] if (s == "train" and missing_train) or (s == "car" and missing_car)])
+                self._set_pending(
+                    session,
+                    scope="shared",
+                    slots=[s for s in ["train", "car"] if (s == "train" and missing_train) or (s == "car" and missing_car)],
+                )
 
                 if cnt >= 3:
                     session["pending"] = None
@@ -522,10 +607,8 @@ class DialogManager:
                 await self._save_session(chat_id_hash, session)
                 return BotReply(text=self._train_car_question_for(primary, missing_train, missing_car))
 
-            # если обе есть — сбрасываем цикл
             self._loop_reset(session)
 
-        # ===== collect missing per-case and submit =====
         for ct in ["lost", "complaint", "gratitude"]:
             for case in session["cases"]:
                 if case["type"] != ct or case["status"] not in ("open", "collecting"):
