@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, Optional, List, Tuple
 from datetime import datetime, timezone
 import logging
+import secrets
 
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ASCENDING
@@ -45,11 +46,19 @@ class MongoStore:
                 if existing == keys_norm:
                     # если хотели unique, а он не unique — логнем
                     if opts.get("unique") and not idx.get("unique", False):
-                        log.warning("Mongo index exists but NOT unique for %s on %s", keys_norm, coll.name)
+                        log.warning(
+                            "Mongo index exists but NOT unique for %s on %s",
+                            keys_norm,
+                            coll.name,
+                        )
                     return
         except Exception as e:
             # если list_indexes нельзя/ошибка — просто попробуем create_index и обработаем конфликт
-            log.warning("Mongo list_indexes failed for %s: %s", getattr(coll, "name", "unknown"), e)
+            log.warning(
+                "Mongo list_indexes failed for %s: %s",
+                getattr(coll, "name", "unknown"),
+                e,
+            )
 
         # 2) пробуем создать
         try:
@@ -57,7 +66,12 @@ class MongoStore:
         except OperationFailure as e:
             if getattr(e, "code", None) == 85:
                 # IndexOptionsConflict / different name — не валим сервис
-                log.warning("Mongo index conflict (code 85) for %s on %s: %s", keys_norm, coll.name, e)
+                log.warning(
+                    "Mongo index conflict (code 85) for %s on %s: %s",
+                    keys_norm,
+                    coll.name,
+                    e,
+                )
                 return
             raise
 
@@ -78,9 +92,13 @@ class MongoStore:
 
         # ✅ индексы (без падения)
         await self._ensure_index(self.sessions, [("chatIdHash", ASCENDING)], unique=True)
-        await self._ensure_index(self.messages, [("chatIdHash", ASCENDING), ("createdAt", ASCENDING)])
-        await self._ensure_index(self.cases, [("chatIdHash", ASCENDING), ("status", ASCENDING), ("type", ASCENDING)])
-        # если у тебя уже есть unique caseId_1 — будет ок, мы просто будем писать caseId в документе
+        await self._ensure_index(
+            self.messages, [("chatIdHash", ASCENDING), ("createdAt", ASCENDING)]
+        )
+        await self._ensure_index(
+            self.cases,
+            [("chatIdHash", ASCENDING), ("status", ASCENDING), ("type", ASCENDING)],
+        )
 
         self.enabled = True
 
@@ -126,8 +144,20 @@ class MongoStore:
     async def create_case(self, doc: Dict[str, Any]) -> None:
         if not self.enabled:
             return
+
         d = dict(doc)
         d.pop("_id", None)
+
+        # ✅ гарантируем caseId (иначе unique index caseId_1 упадёт на null)
+        if not d.get("caseId"):
+            if d.get("ticketId"):
+                d["caseId"] = str(d["ticketId"])
+            else:
+                d["caseId"] = (
+                    f"KTZH-{utcnow().strftime('%Y%m%d%H%M%S')}-"
+                    f"{secrets.token_hex(3).upper()}"
+                )
+
         d.setdefault("createdAt", utcnow().isoformat())
         d.setdefault("updatedAt", utcnow().isoformat())
         await self.cases.insert_one(d)
