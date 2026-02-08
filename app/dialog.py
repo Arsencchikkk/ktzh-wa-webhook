@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 import datetime as dt
-import hashlib
 import re
 import secrets
 
@@ -54,17 +53,14 @@ def _extract_train_fallback(text: str) -> Optional[str]:
     t = (text or "").strip()
     tn = normalize(t)
 
-    # 81/82
     m = re.search(r"\b(\d{1,3}\s*/\s*\d{1,3})\b", tn)
     if m:
         return m.group(1).replace(" ", "").upper()
 
-    # 10ЦА / 123А / 45abc (1-4 цифры + 1-3 буквы)
     m = re.search(r"\b(\d{1,4}\s*[a-zа-я]{1,3})\b", tn)
     if m:
         return m.group(1).replace(" ", "").upper()
 
-    # "поезд 81" / "поезд 81/82"
     m = re.search(r"\bпоезд\s*(\d{1,3}(?:\s*/\s*\d{1,3})?)\b", tn)
     if m:
         return m.group(1).replace(" ", "").upper()
@@ -107,7 +103,6 @@ def _is_generic_complaint(text: str) -> bool:
         "жалоба",
         "пожаловаться",
     )
-    # слишком короткие общие фразы
     return any(g in t for g in generic) and len(t.split()) <= 6
 
 
@@ -205,15 +200,55 @@ class DialogManager:
                 "cases": [],
                 "pending": None,
                 "moderation": {"prev_text": None, "repeat_count": 0, "last_ts": 0.0},
+                # ✅ анти-цикл
+                "loop": {"key": None, "count": 0},
                 "createdAt": _now_utc().isoformat(),
                 "updatedAt": _now_utc().isoformat(),
             }
+        # если старая сессия без loop
+        if "loop" not in s:
+            s["loop"] = {"key": None, "count": 0}
         return s
 
     async def _save_session(self, chat_id_hash: str, session: Dict[str, Any]) -> None:
         session["updatedAt"] = _now_utc().isoformat()
         if hasattr(self.store, "save_session"):
             await self.store.save_session(chat_id_hash, session)
+
+    # =========================
+    # ✅ Anti-loop helpers
+    # =========================
+    def _loop_bump(self, session: Dict[str, Any], key: str) -> int:
+        loop = session.get("loop") or {"key": None, "count": 0}
+        if loop.get("key") == key:
+            loop["count"] = int(loop.get("count", 0)) + 1
+        else:
+            loop["key"] = key
+            loop["count"] = 1
+        session["loop"] = loop
+        return int(loop["count"])
+
+    def _loop_reset(self, session: Dict[str, Any]) -> None:
+        session["loop"] = {"key": None, "count": 0}
+
+    def _ops_template(self, case_type: str) -> str:
+        base = (
+            "Похоже, я не могу корректно оформить заявку автоматически.\n"
+            "Пожалуйста, отправьте одним сообщением для оперативников по шаблону:\n\n"
+            "1) Тип обращения: ЖАЛОБА / ПОТЕРЯЛ(А) ВЕЩЬ / БЛАГОДАРНОСТЬ\n"
+            "2) Поезд № (например: Т78 или 10ЦА или 81/82):\n"
+            "3) Маршрут (откуда–куда):\n"
+            "4) Дата поездки (дд.мм.гггг):\n"
+            "5) Время/примерно когда:\n"
+            "6) Вагон №:\n"
+            "7) Место/купе (если есть):\n"
+            "8) Детали обращения (2–4 предложения):\n"
+        )
+        if case_type == "lost":
+            return base.replace("8) Детали обращения", "8) Что потеряли + приметы (цвет/марка) и где оставили")
+        return base
+
+    # =========================
 
     def _get_or_create_case(self, session: Dict[str, Any], case_type: str) -> Dict[str, Any]:
         for c in session["cases"]:
@@ -241,6 +276,7 @@ class DialogManager:
         session["shared"] = {"train": None, "car": None}
         session["cases"] = []
         session["pending"] = None
+        self._loop_reset(session)
 
     def _close_all_cases(self, session: Dict[str, Any], reason: str) -> None:
         for c in session["cases"]:
@@ -249,6 +285,7 @@ class DialogManager:
                 c["closeReason"] = reason
                 c["closedAt"] = _now_utc().isoformat()
         session["pending"] = None
+        self._loop_reset(session)
 
     def _set_pending(self, session: Dict[str, Any], scope: str, slots: List[str], case_type: Optional[str] = None) -> None:
         session["pending"] = {"scope": scope, "slots": slots, "caseType": case_type}
@@ -297,6 +334,7 @@ class DialogManager:
                 "payload": {"shared": session.get("shared"), "slots": case.get("slots")},
             })
 
+        self._loop_reset(session)
         return case_id
 
     def _apply_pending(self, session: Dict[str, Any], text: str) -> None:
@@ -350,6 +388,7 @@ class DialogManager:
                     cs["item"] = it
 
             if "complaintText" in slots and not cs.get("complaintText"):
+                # ✅ если текст длиннее и не только поезд/вагон — считаем деталями
                 if (not _is_train_car_only(text)) and (not _is_generic_complaint(text)):
                     cs["complaintText"] = _short(text)
 
@@ -371,7 +410,7 @@ class DialogManager:
     async def handle(self, chat_id_hash: str, chat_meta: Dict[str, Any], user_text: str) -> BotReply:
         session = await self._load_session(chat_id_hash)
 
-        # ✅ FIX: чтобы не было unique-конфликта по (channelId, chatId) когда в базе есть такой индекс
+        # ✅ FIX: если есть старый unique индекс по (channelId, chatId)
         session["chatId"] = str(chat_meta.get("chatId") or session.get("chatId") or "")
         session["channelId"] = str(chat_meta.get("channelId") or session.get("channelId") or "")
         session["chatType"] = str(chat_meta.get("chatType") or session.get("chatType") or "")
@@ -395,6 +434,7 @@ class DialogManager:
             await self._save_session(chat_id_hash, session)
             return BotReply(text="Ок, остановил. Начнём заново — напишите, что случилось.")
 
+        # если был pending — пробуем применить
         if session.get("pending"):
             self._apply_pending(session, text)
 
@@ -455,16 +495,26 @@ class DialogManager:
                 primary = ct
                 break
 
-        # missing train/car
-        shared_missing = []
+        # =========================
+        # ✅ Anti-loop for train/car
+        # =========================
         if primary:
+            shared_missing = []
             if not shared.get("train"):
                 shared_missing.append("train")
             if not shared.get("car"):
                 shared_missing.append("car")
 
             if shared_missing:
+                cnt = self._loop_bump(session, "ask_train_car")
                 self._set_pending(session, scope="shared", slots=shared_missing)
+
+                # 3-й раз подряд -> шаблон оперативникам
+                if cnt >= 3:
+                    session["pending"] = None
+                    await self._save_session(chat_id_hash, session)
+                    return BotReply(text=self._ops_template(primary))
+
                 await self._save_session(chat_id_hash, session)
                 return BotReply(text=self._train_car_question_for(primary))
 
@@ -474,6 +524,7 @@ class DialogManager:
                 if case["type"] != ct or case["status"] not in ("open", "collecting"):
                     continue
 
+                # если готово -> submit
                 if self._is_case_ready(session, case) and case["status"] != "open":
                     case_id = await self._submit_case(chat_id_hash, session, case)
                     await self._save_session(chat_id_hash, session)
@@ -490,13 +541,27 @@ class DialogManager:
                     if not cs.get("when"):
                         need.append("when")
                     if need:
+                        cnt = self._loop_bump(session, "ask_lost_bundle")
                         self._set_pending(session, scope="case", slots=need, case_type="lost")
+
+                        if cnt >= 3:
+                            session["pending"] = None
+                            await self._save_session(chat_id_hash, session)
+                            return BotReply(text=self._ops_template("lost"))
+
                         await self._save_session(chat_id_hash, session)
                         return BotReply(text=self._lost_bundle_question(angry=(is_angry or is_flood)))
 
                 if ct == "complaint":
                     if not cs.get("complaintText"):
+                        cnt = self._loop_bump(session, "ask_complaint_text")
                         self._set_pending(session, scope="case", slots=["complaintText"], case_type="complaint")
+
+                        if cnt >= 3:
+                            session["pending"] = None
+                            await self._save_session(chat_id_hash, session)
+                            return BotReply(text=self._ops_template("complaint"))
+
                         await self._save_session(chat_id_hash, session)
                         return BotReply(
                             text="Понял(а). Что именно случилось? (1–2 предложения, например: опоздал на 1 час / хамство / грязно / не работало отопление)."
@@ -504,7 +569,14 @@ class DialogManager:
 
                 if ct == "gratitude":
                     if not cs.get("gratitudeText"):
+                        cnt = self._loop_bump(session, "ask_gratitude_text")
                         self._set_pending(session, scope="case", slots=["gratitudeText"], case_type="gratitude")
+
+                        if cnt >= 3:
+                            session["pending"] = None
+                            await self._save_session(chat_id_hash, session)
+                            return BotReply(text=self._ops_template("gratitude"))
+
                         await self._save_session(chat_id_hash, session)
                         return BotReply(text="Понял(а). Напишите, пожалуйста, за что благодарите (1–2 предложения).")
 
