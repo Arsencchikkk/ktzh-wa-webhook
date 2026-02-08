@@ -18,12 +18,10 @@ def extract_train_and_car(text: str) -> Tuple[Optional[str], Optional[int]]:
     train = None
     car = None
 
-    # Т58 / T58 / т 58
     m = re.search(r"\b[тt]\s*[-]?\s*(\d{1,4})\b", t)
     if m:
         train = f"Т{m.group(1)}"
 
-    # вагон 9 / 9 вагон
     m = re.search(r"\bвагон\s*(\d{1,2})\b|\b(\d{1,2})\s*вагон\b", t)
     if m:
         num = next((g for g in m.groups() if g), None)
@@ -47,13 +45,12 @@ def detect_aggression_and_flood(session: Dict[str, Any], text: str) -> Tuple[Dic
     else:
         repeat = 0
 
-    # flood: много одинаковых/частых сообщений
     last_ts = mod.get("last_ts", 0.0)
-    dt = now - float(last_ts or 0.0)
-    flooding = (dt < 2.0 and len(t) < 30) or repeat >= 2
+    dt_sec = now - float(last_ts or 0.0)
+    flooding = (dt_sec < 2.0 and len(t) < 30) or repeat >= 2
 
-    # aggression: грубые слова (минимально)
-    angry_words = ("дебил", "идиот", "сука", "блять", "тупой", "прекрати")
+    # ✅ "прекрати" НЕ считаем агрессией (это cancel)
+    angry_words = ("дебил", "идиот", "сука", "блять", "тупой")
     angry = any(w in t for w in angry_words)
 
     mod["prev_text"] = t
@@ -75,16 +72,16 @@ class NluResult:
 
 class SimpleNLU:
     def analyze(self, text: str) -> NluResult:
-        t = normalize(text)
+        orig = (text or "").strip()
+        t = normalize(orig)
 
-        # cancel words
         cancel_words = ("стоп", "отмена", "прекрати", "хватит", "закрой", "не надо")
         cancel = any(w in t for w in cancel_words)
 
-        # greeting
         greeting = bool(re.search(r"\b(привет|здравствуйте|здрасьте|добрый\s*(день|вечер|утро)|салам)\b", t))
+        # ✅ greeting_only — только если реально одно приветствие
+        greeting_only = bool(re.fullmatch(r"(привет|здравствуйте|здрасьте|салам|добрый\s*(день|вечер|утро))", t))
 
-        # intents
         intents: List[str] = []
         if any(k in t for k in ("благодар", "поблагодар", "спасибо", "рахмет")):
             intents.append("gratitude")
@@ -102,7 +99,14 @@ class SimpleNLU:
         if car is not None:
             slots["car"] = car
 
-        # meaning score
+        # ✅ staffName (проводника Аймуратова / кассира Иванова)
+        m = re.search(
+            r"(проводник\w*|кассир\w*|сотрудник\w*|начальник\w*\s*поезда?)\s+([А-ЯЁ][а-яё]+(?:\s+[А-ЯЁ][а-яё]+){0,2})",
+            orig
+        )
+        if m:
+            slots["staffName"] = m.group(2)
+
         score = 0
         if intents:
             score += 2
@@ -110,8 +114,6 @@ class SimpleNLU:
             score += 1
         if len(t) >= 12:
             score += 1
-
-        greeting_only = greeting and not intents and not slots and len(t.split()) <= 2
 
         return NluResult(
             intents=intents,
