@@ -55,14 +55,14 @@ class MongoStore:
         return await self.sessions.find_one({"chatIdHash": chat_id_hash})
 
     async def save_session(self, chat_id_hash: str, session: Dict[str, Any]) -> None:
-    doc = dict(session)
+        doc = dict(session)
 
     created = doc.get("createdAt") or utcnow().isoformat()
     doc["chatIdHash"] = chat_id_hash
     doc["updatedAt"] = utcnow().isoformat()
 
-    # : createdAt нельзя одновременно в $set и $setOnInsert
-    doc.pop("createdAt", None)
+    # 🔥 важно: createdAt НЕ должен попасть в $set, иначе конфликт с $setOnInsert
+    d None)
 
     await self.sessions.update_one(
         {"chatIdHash": chat_id_hash},
@@ -72,6 +72,7 @@ class MongoStore:
         },
         upsert=True,
     )
+
 
 
     async def add_message(self, doc: Dict[str, Any]) -> None:
