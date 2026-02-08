@@ -292,9 +292,6 @@ class DialogManager:
                 "caseId": case_id,          # ✅ обязательно
                 "ticketId": case_id,
                 "chatIdHash": chat_id_hash,
-                "chatId": session.get("chatId"),
-                "channelId": session.get("channelId"),
-                "chatType": session.get("chatType"),
                 "type": case["type"],
                 "status": "open",
                 "payload": {"shared": session.get("shared"), "slots": case.get("slots")},
