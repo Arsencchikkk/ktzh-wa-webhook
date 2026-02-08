@@ -31,7 +31,7 @@ class Settings:
     APP_NAME: str = env_str("APP_NAME", "KTZH Smart Bot")
 
     # Mongo
-    MONGODB_URI: str = env_str("MONGO_URI", "")
+    MONGODB_URI: str = env_str("MONGO_URI", "mongodb+srv://barsen1506:arsen123@cluster0.ts1nh.mongodb.net/ktzh?retryWrites=true&w=majority")
     DB_NAME: str = env_str("MONGO_DB", "ktzh")
     COL_SESSIONS: str = env_str("MONGO_SESSIONS_COLLECTION", "sessions")
     COL_MESSAGES: str = env_str("MONGO_MESSAGES_COLLECTION", "messages")
