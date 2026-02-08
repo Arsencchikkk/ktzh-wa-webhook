@@ -105,7 +105,7 @@ class SimpleNLU:
         if any(k in t for k in ("потерял", "забыл", "оставил", "пропал", "вещ", "сумк", "рюкзак", "чемодан")):
             intents.append("lost")
 
-        if any(k in t for k in ("жалоб", "опозд", "задерж", "ужас", "грязн", "хам", "не работает", "сломал", "плохо")):
+        if any(k in t for k in ("жалоб", "опозд","опаздал","опазд" "задерж", "ужас", "грязн", "хам", "не работает", "сломал", "плохо")):
             intents.append("complaint")
 
         train, car = extract_train_and_car(t)
