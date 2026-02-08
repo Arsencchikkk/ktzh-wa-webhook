@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 import hashlib
 import logging
 
@@ -25,12 +25,16 @@ wazzup = WazzupClient(settings.WAZZUP_API_KEY)
 @app.on_event("startup")
 async def startup():
     await store.connect()
+    if getattr(store, "enabled", False):
+        log.info("Mongo: ENABLED ✅")
+    else:
+        log.warning("Mongo: DISABLED ⚠️ (set MONGODB_URI / MONGO_URI in Render ENV)")
 
 
 @app.on_event("shutdown")
 async def shutdown():
     await store.close()
-    # если у тебя нет close() в WazzupClient — просто удали следующую строку
+    # если у WazzupClient нет close() — убери следующую строку или добавь метод
     if hasattr(wazzup, "close"):
         await wazzup.close()
 
@@ -41,10 +45,13 @@ def chat_hash(chat_id: str) -> str:
 
 
 def extract_inbound(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    if "statuses" in payload:
+    # на всякий случай — если сюда прилетела обёртка
+    if "statuses" in payload or "messages" in payload:
         return None
+
     if payload.get("isEcho") is True:
         return None
+
     direction = payload.get("direction")
     if direction and direction != "inbound":
         return None
@@ -54,6 +61,7 @@ def extract_inbound(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         raw = payload.get("raw") or {}
         if isinstance(raw, dict):
             text = raw.get("text")
+
     if not text:
         content = payload.get("content") or {}
         if isinstance(content, dict):
@@ -79,6 +87,38 @@ def _check_token(request: Request) -> None:
             raise HTTPException(status_code=401, detail="Invalid webhook token")
 
 
+def _payload_to_items(payload: Any) -> List[Dict[str, Any]]:
+    """
+    Wazzup может прислать:
+    - {"messages":[...]}
+    - {"statuses":[...]}
+    - single message dict
+    - list of dicts
+    """
+    items: List[Dict[str, Any]] = []
+
+    if isinstance(payload, list):
+        # иногда это уже список сообщений
+        for x in payload:
+            if isinstance(x, dict) and "messages" in x and isinstance(x["messages"], list):
+                items.extend([m for m in x["messages"] if isinstance(m, dict)])
+            elif isinstance(x, dict) and "statuses" in x and isinstance(x["statuses"], list):
+                # статусы просто игнорим
+                continue
+            elif isinstance(x, dict):
+                items.append(x)
+        return items
+
+    if isinstance(payload, dict):
+        if "messages" in payload and isinstance(payload["messages"], list):
+            return [m for m in payload["messages"] if isinstance(m, dict)]
+        if "statuses" in payload:
+            return []  # игнорим статусы
+        return [payload]
+
+    return []
+
+
 @app.get("/")
 def root():
     return {"ok": True, "service": settings.APP_NAME}
@@ -93,6 +133,9 @@ async def process_items(items: list) -> None:
     log.info("WEBHOOK: got %s item(s)", len(items))
 
     for item in items:
+        if not isinstance(item, dict):
+            continue
+
         msg = extract_inbound(item)
         if not msg or not msg["chatId"]:
             log.info("SKIP: not inbound text payload keys=%s", list(item.keys())[:20])
@@ -101,19 +144,15 @@ async def process_items(items: list) -> None:
         chat_id_hash = chat_hash(msg["chatId"])
         log.info("IN: chatId=%s text=%r", msg["chatId"], msg["text"])
 
-        # входящее в Mongo
-        try:
-            await store.add_message({
-                "dir": "in",
-                "chatIdHash": chat_id_hash,
-                "chatId": msg["chatId"],
-                "channelId": msg["channelId"],
-                "chatType": msg["chatType"],
-                "text": msg["text"],
-                "raw": msg["raw"],
-            })
-        except Exception:
-            log.exception("Mongo add_message(in) failed")
+        await store.add_message({
+            "dir": "in",
+            "chatIdHash": chat_id_hash,
+            "chatId": msg["chatId"],
+            "channelId": msg["channelId"],
+            "chatType": msg["chatType"],
+            "text": msg["text"],
+            "raw": msg["raw"],
+        })
 
         try:
             bot_reply = await dialog.handle(
@@ -142,18 +181,15 @@ async def process_items(items: list) -> None:
             )
             log.info("SENT: %s", send_res)
 
-            try:
-                await store.add_message({
-                    "dir": "out",
-                    "chatIdHash": chat_id_hash,
-                    "chatId": msg["chatId"],
-                    "channelId": msg["channelId"],
-                    "chatType": msg["chatType"],
-                    "text": bot_reply.text,
-                    "send": send_res,
-                })
-            except Exception:
-                log.exception("Mongo add_message(out) failed")
+            await store.add_message({
+                "dir": "out",
+                "chatIdHash": chat_id_hash,
+                "chatId": msg["chatId"],
+                "channelId": msg["channelId"],
+                "chatType": msg["chatType"],
+                "text": bot_reply.text,
+                "send": send_res,
+            })
 
 
 @app.post("/webhooks")
@@ -166,7 +202,11 @@ async def wazzup_webhook(request: Request, background: BackgroundTasks):
     _check_token(request)
 
     payload = await request.json()
-    items = payload if isinstance(payload, list) else [payload]
+    items = _payload_to_items(payload)
+
+    # если пришли только statuses — просто 200 OK
+    if not items:
+        return JSONResponse({"ok": True, "ignored": True})
 
     background.add_task(process_items, items)
     return JSONResponse({"ok": True, "queued": len(items)})
