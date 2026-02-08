@@ -12,7 +12,7 @@ from .db import MongoStore
 from .dialog import DialogManager
 from .wazzup_client import WazzupClient
 
-log = logging.getLogger("ktzh-bot")
+log = logging.getLogger("ktzh")
 logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(title=settings.APP_NAME)
