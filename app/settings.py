@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import os
 from dataclasses import dataclass
 
@@ -30,8 +31,8 @@ def env_bool(key: str, default: bool = False) -> bool:
 class Settings:
     APP_NAME: str = env_str("APP_NAME", "KTZH Smart Bot")
 
-    # Mongo
-    MONGODB_URI: str = env_str("MONGODB_URI", "mongodb+srv://barsen1506:arsen123@cluster0.ts1nh.mongodb.net/ktzh?retryWrites=true&w=majority")
+    # Mongo (берём из MONGODB_URI или MONGO_URI)
+    MONGODB_URI: str = env_str("MONGODB_URI", env_str("MONGO_URI", ""))
     DB_NAME: str = env_str("MONGO_DB", "ktzh")
     COL_SESSIONS: str = env_str("MONGO_SESSIONS_COLLECTION", "sessions")
     COL_MESSAGES: str = env_str("MONGO_MESSAGES_COLLECTION", "messages")
@@ -53,10 +54,11 @@ class Settings:
     MAX_HISTORY: int = env_int("MAX_HISTORY", 20)
     FLOOD_WINDOW_SEC: int = env_int("FLOOD_WINDOW_SEC", 8)
     FLOOD_MAX_MSG: int = env_int("FLOOD_MAX_MSG", 4)
-   TEST_MODE: bool = env_bool("TEST_MODE", False)
-   TEST_CHAT_ID: str = env_str("TEST_CHAT_ID", "")
-   TEST_CHANNEL_ID: str = env_str("TEST_CHANNEL_ID", "")  # optional
 
+    # ✅ Test mode (принимаем/отвечаем только одному абоненту)
+    TEST_MODE: bool = env_bool("TEST_MODE", False)
+    TEST_CHAT_ID: str = env_str("TEST_CHAT_ID", "")
+    TEST_CHANNEL_ID: str = env_str("TEST_CHANNEL_ID", "")
 
 
 settings = Settings()
