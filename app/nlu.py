@@ -17,7 +17,7 @@ def extract_train_and_car(text: str) -> Tuple[Optional[str], Optional[int]]:
     Ловим поезд в форматах:
       - Т58 / т 58 / T58
       - 10ЦА / 123А / 81/82
-      - тц10 / TC10 / ца80  (буквы+цифры)  ✅ добавлено
+      - тц10 / TC10 / ца80  (буквы+цифры)
     """
     t = normalize(text)
 
@@ -34,7 +34,6 @@ def extract_train_and_car(text: str) -> Tuple[Optional[str], Optional[int]]:
     # 2) 81/82, 10ца, 123а (цифры + буквы)
     # ВАЖНО: не спутать с "8 вагон"
     if not train:
-        # если рядом явно "вагон" — не считаем это поездом
         if not re.search(r"\bвагон\s*\d{1,2}\b|\b\d{1,2}\s*вагон\b", t):
             m = re.search(r"\b(\d{2,4}(?:\s*/\s*\d{2,4})?[a-zа-я]{0,3})\b", t)
             if m:
@@ -42,13 +41,13 @@ def extract_train_and_car(text: str) -> Tuple[Optional[str], Optional[int]]:
                 if not re.fullmatch(r"\d{1,2}", cand):
                     train = cand
 
-    # 3) тц10 / TC10 / ца80 (буквы + цифры) ✅
+    # 3) тц10 / TC10 / ца80 (буквы + цифры)
+    # ✅ ВАЖНО: минимум 2 буквы, чтобы не ловить "в 19:00" как поезд "В19"
     if not train:
-        m = re.search(r"\b([a-zа-я]{1,3})\s*[-]?\s*(\d{1,4})\b", t)
+        m = re.search(r"\b([a-zа-я]{2,3})\s*[-]?\s*(\d{1,4})\b", t)
         if m:
             letters = m.group(1)
             digits = m.group(2)
-            # чтобы не ловить мусорные слова
             if letters not in {"ваг", "вагон", "мест", "место", "куп", "купе"}:
                 train = f"{letters}{digits}".upper()
 
@@ -80,7 +79,6 @@ def detect_aggression_and_flood(session: Dict[str, Any], text: str) -> Tuple[Dic
     dt_sec = now - float(last_ts or 0.0)
     flooding = (dt_sec < 2.0 and len(t) < 30) or repeat >= 2
 
-    # ✅ "прекрати" НЕ считаем агрессией (это cancel)
     angry_words = ("дебил", "идиот", "сука", "блять", "тупой")
     angry = any(w in t for w in angry_words)
 
@@ -112,7 +110,6 @@ class SimpleNLU:
         "задерж", "задержк",
         "грязн", "хам", "не работает", "не работал", "сломал", "плохо", "ужас", "беспредел",
     )
-
     COMPLAINT_HINTS = ("опаз", "задерж", "час", "мин", "беспредел", "ужас", "кошмар", "невыносимо")
 
     def analyze(self, text: str) -> NluResult:
@@ -122,18 +119,16 @@ class SimpleNLU:
         cancel_words = ("стоп", "отмена", "прекрати", "хватит", "закрой", "не надо")
         cancel = any(w in t for w in cancel_words)
 
+        # ✅ greeting_only с пунктуацией
         greeting_only = bool(
-            re.fullmatch(r"(привет|здравствуйте|здрасьте|салам|добрый\s*(день|вечер|утро))", t)
+            re.fullmatch(r"(привет|здравствуйте|здрасьте|салам|добрый\s*(день|вечер|утро))[\s!.,…]*", t)
         )
 
         intents: List[str] = []
-
         if any(k in t for k in self.GRATITUDE_KEYS):
             intents.append("gratitude")
-
         if any(k in t for k in self.LOST_KEYS):
             intents.append("lost")
-
         if any(k in t for k in self.COMPLAINT_KEYS) or any(h in t for h in self.COMPLAINT_HINTS):
             intents.append("complaint")
 
@@ -144,7 +139,6 @@ class SimpleNLU:
         if car is not None:
             slots["car"] = car
 
-        # staffName (проводника Аймуратова / кассира Иванова)
         m = re.search(
             r"(проводник\w*|кассир\w*|сотрудник\w*|начальник\w*\s*поезда?)\s+([А-ЯЁA-Z][а-яёa-z]+(?:\s+[А-ЯЁA-Z][а-яёa-z]+){0,2})",
             orig,
