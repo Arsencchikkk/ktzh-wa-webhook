@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional
 import datetime as dt
 import hashlib
 import re
+import secrets
 
 from .nlu import build_nlu, extract_train_and_car, detect_aggression_and_flood, normalize
 
@@ -20,9 +21,13 @@ def _now_utc() -> dt.datetime:
 
 
 def _gen_case_id(prefix: str, chat_id_hash: str) -> str:
+    """
+    ВАЖНО: не детерминированный id, чтобы не было дублей в один день.
+    """
     d = _now_utc().strftime("%Y%m%d")
-    h = hashlib.sha256((prefix + "|" + d + "|" + chat_id_hash).encode("utf-8")).hexdigest().upper()
-    return f"{prefix}-{d}-{h[:8]}"
+    short_chat = chat_id_hash[:6].upper()
+    rnd = secrets.token_hex(3).upper()  # 6 hex chars
+    return f"{prefix}-{d}-{short_chat}-{rnd}"
 
 
 def _short(text: str) -> str:
@@ -38,24 +43,58 @@ def _is_only_number(text: str) -> Optional[int]:
     return v if 1 <= v <= 99 else None
 
 
+def _extract_train_fallback(text: str) -> Optional[str]:
+    """
+    Фолбек для поездов типа:
+      - 81/82
+      - 10ЦА
+      - 123А
+    (без префикса Т)
+    """
+    t = (text or "").strip()
+    tn = normalize(t)
+
+    # 81/82
+    m = re.search(r"\b(\d{1,3}\s*/\s*\d{1,3})\b", tn)
+    if m:
+        return m.group(1).replace(" ", "").upper()
+
+    # 10ЦА / 123А / 45abc (1-4 цифры + 1-3 буквы)
+    m = re.search(r"\b(\d{1,4}\s*[a-zа-я]{1,3})\b", tn)
+    if m:
+        return m.group(1).replace(" ", "").upper()
+
+    # "поезд 81" / "поезд 81/82"
+    m = re.search(r"\bпоезд\s*(\d{1,3}(?:\s*/\s*\d{1,3})?)\b", tn)
+    if m:
+        return m.group(1).replace(" ", "").upper()
+
+    return None
+
+
+def _extract_train_car_any(text: str) -> tuple[Optional[str], Optional[int]]:
+    tr, car = extract_train_and_car(text)
+    if not tr:
+        tr = _extract_train_fallback(text)
+    return tr, car
+
+
 def _is_train_car_only(text: str) -> bool:
     t = normalize(text)
-    tr, car = extract_train_and_car(t)
-    tokens = re.findall(r"[a-zа-я0-9]+", t)
+    tr, car = _extract_train_car_any(t)
+    tokens = re.findall(r"[a-zа-я0-9/]+", t)
     if not tokens:
         return False
-    # если токены в основном про поезд/вагон
+
     allowed = {"т", "t", "вагон", "поезд"}
-    # добавим числа поезда/вагона
     if tr:
-        allowed.add(normalize(tr).replace("т", ""))
         allowed.add(normalize(tr))
+        allowed.add(normalize(tr).replace("т", "").strip())
     if car is not None:
         allowed.add(str(car))
 
-    # грубая эвристика: всё короткое и почти без слов кроме поезд/вагон/числа
     meaningful = [x for x in tokens if x not in allowed]
-    return len(meaningful) <= 1 and len(tokens) <= 5
+    return len(meaningful) <= 1 and len(tokens) <= 6
 
 
 def _is_generic_complaint(text: str) -> bool:
@@ -65,16 +104,17 @@ def _is_generic_complaint(text: str) -> bool:
         "хочу жалобу",
         "хочу оставить жалобу",
         "у меня жалоба",
-        "жалоба на поезд",
-        "пожаловаться на поезд",
+        "жалоба",
+        "пожаловаться",
     )
-    return any(g in t for g in generic)
+    # слишком короткие общие фразы
+    return any(g in t for g in generic) and len(t.split()) <= 6
 
 
 def _is_generic_gratitude(text: str) -> bool:
     t = normalize(text)
-    generic = ("хочу поблагодарить", "хочу сказать спасибо", "у меня благодарность", "благодарность")
-    return any(g in t for g in generic) and len(t.split()) <= 5
+    generic = ("хочу поблагодарить", "хочу сказать спасибо", "у меня благодарность", "благодарность", "спасибо")
+    return any(g in t for g in generic) and len(t.split()) <= 6
 
 
 def _extract_place(text: str) -> Optional[str]:
@@ -137,7 +177,7 @@ def _required_slots(case_type: str) -> List[str]:
     if case_type == "complaint":
         return ["train", "car", "complaintText"]
     if case_type == "gratitude":
-        return ["train", "car", "gratitudeText"]  # staffName не обязателен
+        return ["train", "car", "gratitudeText"]
     return []
 
 
@@ -213,15 +253,14 @@ class DialogManager:
     def _set_pending(self, session: Dict[str, Any], scope: str, slots: List[str], case_type: Optional[str] = None) -> None:
         session["pending"] = {"scope": scope, "slots": slots, "caseType": case_type}
 
-    def _train_car_question_for(self, case_type: str, angry: bool) -> str:
+    def _train_car_question_for(self, case_type: str) -> str:
         if case_type == "complaint":
             return "Чтобы оформить жалобу, напишите номер поезда и вагон одним сообщением (пример: Т58, 7 вагон)."
         if case_type == "gratitude":
             return "Чтобы оформить благодарность, напишите номер поезда и вагон (если знаете) одним сообщением (пример: Т58, 7 вагон)."
         if case_type == "lost":
             return "Чтобы помочь найти вещь, напишите номер поезда и вагон одним сообщением (пример: Т58, 7 вагон)."
-        return ("Напишите номер поезда и вагон одним сообщением. Пример: Т58, 7 вагон."
-                if angry else "Уточните номер поезда и номер вагона одним сообщением (пример: Т58, 7 вагон).")
+        return "Уточните номер поезда и номер вагона одним сообщением (пример: Т58, 7 вагон)."
 
     def _lost_bundle_question(self, angry: bool = False) -> str:
         return (
@@ -250,9 +289,12 @@ class DialogManager:
 
         if hasattr(self.store, "create_case"):
             await self.store.create_case({
+                "caseId": case_id,          # ✅ обязательно
                 "ticketId": case_id,
-                "caseId": case_id,
                 "chatIdHash": chat_id_hash,
+                "chatId": session.get("chatId"),
+                "channelId": session.get("channelId"),
+                "chatType": session.get("chatType"),
                 "type": case["type"],
                 "status": "open",
                 "payload": {"shared": session.get("shared"), "slots": case.get("slots")},
@@ -269,7 +311,7 @@ class DialogManager:
         slots: List[str] = p.get("slots") or []
         case_type = p.get("caseType")
 
-        train, car = extract_train_and_car(text)
+        train, car = _extract_train_car_any(text)
         shared = session["shared"]
 
         if scope == "shared":
@@ -311,11 +353,11 @@ class DialogManager:
                     cs["item"] = it
 
             if "complaintText" in slots and not cs.get("complaintText"):
-                if not _is_train_car_only(text) and not _is_generic_complaint(text):
+                if (not _is_train_car_only(text)) and (not _is_generic_complaint(text)):
                     cs["complaintText"] = _short(text)
 
             if "gratitudeText" in slots and not cs.get("gratitudeText"):
-                if not _is_train_car_only(text):
+                if (not _is_train_car_only(text)) and (not _is_generic_gratitude(text)):
                     cs["gratitudeText"] = _short(text)
 
             ok = True
@@ -332,13 +374,18 @@ class DialogManager:
     async def handle(self, chat_id_hash: str, chat_meta: Dict[str, Any], user_text: str) -> BotReply:
         session = await self._load_session(chat_id_hash)
 
+        # ✅ FIX: чтобы не было unique-конфликта по (channelId, chatId) когда в базе есть такой индекс
+        session["chatId"] = str(chat_meta.get("chatId") or session.get("chatId") or "")
+        session["channelId"] = str(chat_meta.get("channelId") or session.get("channelId") or "")
+        session["chatType"] = str(chat_meta.get("chatType") or session.get("chatType") or "")
+
         text = user_text or ""
         tnorm = normalize(text)
 
         # cancel
         if tnorm in {"стоп", "хватит", "отмена", "прекрати", "прекратите"}:
             self._close_all_cases(session, reason="user_cancel")
-            self._reset_dialog(session)  # ✅ сбрасываем, чтобы не было повторов
+            self._reset_dialog(session)
             await self._save_session(chat_id_hash, session)
             return BotReply(text="Ок, остановил. Начнём заново — напишите, что случилось.")
 
@@ -359,7 +406,6 @@ class DialogManager:
             await self._save_session(chat_id_hash, session)
             return BotReply(text="Здравствуйте! Опишите проблему одним сообщением (опоздание / забытая вещь / жалоба / благодарность).")
 
-        # intents
         intents: List[str] = list(getattr(nlu_res, "intents", []) or [])
 
         # shared train/car
@@ -371,7 +417,7 @@ class DialogManager:
         if slots.get("car") and not shared.get("car"):
             shared["car"] = slots["car"]
 
-        tr, car = extract_train_and_car(text)
+        tr, car = _extract_train_car_any(text)
         if tr and not shared.get("train"):
             shared["train"] = tr
         if car is not None and not shared.get("car"):
@@ -381,7 +427,7 @@ class DialogManager:
         for it in intents:
             self._get_or_create_case(session, it)
 
-        # fill case texts SMART
+        # fill case texts
         if "complaint" in intents:
             ccase = self._get_or_create_case(session, "complaint")
             if not ccase["slots"].get("complaintText"):
@@ -391,9 +437,8 @@ class DialogManager:
         if "gratitude" in intents:
             gcase = self._get_or_create_case(session, "gratitude")
             if not gcase["slots"].get("gratitudeText"):
-                if not _is_train_car_only(text):
+                if (not _is_train_car_only(text)) and (not _is_generic_gratitude(text)):
                     gcase["slots"]["gratitudeText"] = _short(text)
-            # staffName если NLU дал
             if slots.get("staffName") and not gcase["slots"].get("staffName"):
                 gcase["slots"]["staffName"] = str(slots["staffName"])
 
@@ -406,33 +451,27 @@ class DialogManager:
             if not lcase["slots"].get("when"):
                 lcase["slots"]["when"] = _extract_when(text)
 
-        # if complaint exists but complaintText is generic phrase and new msg has details -> replace
-        for case in session["cases"]:
-            if case["type"] == "complaint":
-                old = case["slots"].get("complaintText") or ""
-                if old and _is_generic_complaint(old) and (not _is_train_car_only(text)) and (not _is_generic_complaint(text)):
-                    case["slots"]["complaintText"] = _short(text)
-
-        # decide primary case
-        primary = None
+        # primary case
+        primary: Optional[str] = None
         for ct in ["lost", "complaint", "gratitude"]:
             if any(c["type"] == ct and c["status"] in ("open", "collecting") for c in session["cases"]):
                 primary = ct
                 break
 
-        # if we have a case but missing train/car -> ask contextual
+        # missing train/car
         shared_missing = []
-        if not shared.get("train"):
-            shared_missing.append("train")
-        if not shared.get("car"):
-            shared_missing.append("car")
+        if primary:
+            if not shared.get("train"):
+                shared_missing.append("train")
+            if not shared.get("car"):
+                shared_missing.append("car")
 
-        if shared_missing and primary:
-            self._set_pending(session, scope="shared", slots=shared_missing)
-            await self._save_session(chat_id_hash, session)
-            return BotReply(text=self._train_car_question_for(primary, angry=(is_angry or is_flood)))
+            if shared_missing:
+                self._set_pending(session, scope="shared", slots=shared_missing)
+                await self._save_session(chat_id_hash, session)
+                return BotReply(text=self._train_car_question_for(primary))
 
-        # now collect missing per-case and submit
+        # collect missing per-case and submit
         for ct in ["lost", "complaint", "gratitude"]:
             for case in session["cases"]:
                 if case["type"] != ct or case["status"] not in ("open", "collecting"):
@@ -462,7 +501,9 @@ class DialogManager:
                     if not cs.get("complaintText"):
                         self._set_pending(session, scope="case", slots=["complaintText"], case_type="complaint")
                         await self._save_session(chat_id_hash, session)
-                        return BotReply(text="Понял(а). Что именно случилось? (1–2 предложения, например: опоздал на 1 час / хамство / грязно / не работало отопление).")
+                        return BotReply(
+                            text="Понял(а). Что именно случилось? (1–2 предложения, например: опоздал на 1 час / хамство / грязно / не работало отопление)."
+                        )
 
                 if ct == "gratitude":
                     if not cs.get("gratitudeText"):
