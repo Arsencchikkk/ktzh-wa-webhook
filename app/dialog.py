@@ -251,6 +251,7 @@ class DialogManager:
         if hasattr(self.store, "create_case"):
             await self.store.create_case({
                 "ticketId": case_id,
+                "caseId": case_id,
                 "chatIdHash": chat_id_hash,
                 "type": case["type"],
                 "status": "open",
