@@ -87,37 +87,46 @@ def _check_token(request: Request) -> None:
             raise HTTPException(status_code=401, detail="Invalid webhook token")
 
 
+
+
 def _payload_to_items(payload: Any) -> List[Dict[str, Any]]:
     """
     Wazzup может прислать:
     - {"messages":[...]}
     - {"statuses":[...]}
     - single message dict
-    - list of dicts
+    - list of dicts (иногда внутри {"messages":[...]} или просто message dicts)
     """
     items: List[Dict[str, Any]] = []
 
+    def add_messages_from(obj: Any) -> None:
+        if not isinstance(obj, dict):
+            return
+
+        # 1) batch messages
+        msgs = obj.get("messages")
+        if isinstance(msgs, list):
+            items.extend([m for m in msgs if isinstance(m, dict)])
+            return
+
+        # 2) statuses -> ignore
+        sts = obj.get("statuses")
+        if isinstance(sts, list) or isinstance(sts, dict):
+            return
+
+        # 3) single message-like dict
+        items.append(obj)
+
     if isinstance(payload, list):
-        # иногда это уже список сообщений
         for x in payload:
-            if isinstance(x, dict) and "messages" in x and isinstance(x["messages"], list):
-                items.extend([m for m in x["messages"] if isinstance(m, dict)])
-            elif isinstance(x, dict) and "statuses" in x and isinstance(x["statuses"], list):
-                # статусы просто игнорим
-                continue
-            elif isinstance(x, dict):
-                items.append(x)
+            add_messages_from(x)
         return items
 
     if isinstance(payload, dict):
-        if "messages" in payload and isinstance(payload["messages"], list):
-            return [m for m in payload["messages"] if isinstance(m, dict)]
-        if "statuses" in payload:
-            return []  # игнорим статусы
-        return [payload]
+        add_messages_from(payload)
+        return items
 
     return []
-
 
 @app.get("/")
 def root():
