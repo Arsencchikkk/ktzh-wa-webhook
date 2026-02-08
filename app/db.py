@@ -9,7 +9,7 @@ from pymongo import ASCENDING
 
 from .settings import settings
 
-log = logging.getLogger("ktzh-bot")
+log = logging.getLogger("ktzh")
 
 
 def utcnow() -> datetime:
@@ -39,13 +39,38 @@ class MongoStore:
         self.messages = self.db[settings.COL_MESSAGES]
         self.cases = self.db[settings.COL_CASES]
 
-        # ping
         await self.db.command("ping")
 
-        # indexes
-        await self.sessions.create_index([("chatIdHash", ASCENDING)], unique=True)
+        # --- DROP legacy/bad unique indexes that cause dup-key with nulls ---
+
+        # sessions: legacy unique (channelId, chatId)
+        async for idx in self.sessions.list_indexes():
+            name = idx.get("name")
+            key = idx.get("key") or {}
+            if name == "session_chat_1" or key == {"channelId": 1, "chatId": 1}:
+                await self.sessions.drop_index(name)
+                log.warning("Mongo: dropped legacy sessions index %s", name)
+
+        # cases: legacy unique caseId (your inserts had no caseId before)
+        async for idx in self.cases.list_indexes():
+            name = idx.get("name")
+            key = idx.get("key") or {}
+            if name == "caseId_1" or key == {"caseId": 1}:
+                await self.cases.drop_index(name)
+                log.warning("Mongo: dropped legacy cases index %s", name)
+
+        # --- correct indexes ---
+
+        await self.sessions.create_index(
+            [("chatIdHash", ASCENDING)],
+            unique=True,
+            name="session_chatIdHash_1",
+        )
         await self.messages.create_index([("chatIdHash", ASCENDING), ("createdAt", ASCENDING)])
         await self.cases.create_index([("chatIdHash", ASCENDING), ("status", ASCENDING), ("type", ASCENDING)])
+
+        # unique ticketId for cases
+        await self.cases.create_index([("ticketId", ASCENDING)], unique=True, name="ticketId_1")
 
         self.enabled = True
         log.info("Mongo: ENABLED ✅ db=%s", settings.DB_NAME)
@@ -66,22 +91,19 @@ class MongoStore:
             return
 
         doc = dict(session)
+        doc.pop("_id", None)
 
-        # createdAt берём из doc, но НЕ кладём в $set (иначе конфликт с $setOnInsert)
         created = doc.get("createdAt") or utcnow().isoformat()
+
+        # IMPORTANT: createdAt must NOT be in $set if you also use $setOnInsert
+        doc.pop("createdAt", None)
 
         doc["chatIdHash"] = chat_id_hash
         doc["updatedAt"] = utcnow().isoformat()
 
-        doc.pop("_id", None)
-        doc.pop("createdAt", None)  # 🔥 ключевой фикс
-
         await self.sessions.update_one(
             {"chatIdHash": chat_id_hash},
-            {
-                "$set": doc,
-                "$setOnInsert": {"createdAt": created},
-            },
+            {"$set": doc, "$setOnInsert": {"createdAt": created}},
             upsert=True,
         )
 
@@ -98,4 +120,11 @@ class MongoStore:
         d = dict(doc)
         d.setdefault("createdAt", utcnow().isoformat())
         d.setdefault("updatedAt", utcnow().isoformat())
+
+        # safety: if someone forgot
+        if "ticketId" not in d and "caseId" in d:
+            d["ticketId"] = d["caseId"]
+        if "caseId" not in d and "ticketId" in d:
+            d["caseId"] = d["ticketId"]
+
         await self.cases.insert_one(d)
