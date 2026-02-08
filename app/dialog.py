@@ -95,26 +95,37 @@ def _is_generic_gratitude(text: str) -> bool:
 
 
 def _extract_place(text: str) -> Optional[str]:
-    tn = normalize(text)
+    t = normalize(text)
 
-    m = re.search(r"\bместо\s*(\d{1,2})\b|\b(\d{1,2})\s*место\b", tn)
+    coupe = None
+    seat = None
+
+    m = re.search(r"\bкупе\s*(\d{1,2})\b", t)
     if m:
-        num = next((g for g in m.groups() if g and g.isdigit()), None)
-        return f"место {num}" if num else None
+        coupe = m.group(1)
 
-    m = re.search(r"\bкупе\s*(\d{1,2})\b", tn)
+    m = re.search(r"\bместо\s*(\d{1,2})\b|\b(\d{1,2})\s*место\b", t)
     if m:
-        return f"купе {m.group(1)}"
+        seat = next((g for g in m.groups() if g and g.isdigit()), None)
 
-    if "тамбур" in tn:
+    if "тамбур" in t:
         return "тамбур"
 
-    if "верх" in tn and "полк" in tn:
+    if "верх" in t and "полк" in t:
         return "верхняя полка"
-    if "ниж" in tn and "полк" in tn:
+    if "ниж" in t and "полк" in t:
         return "нижняя полка"
 
+    # ✅ если указали и купе, и место — склеиваем
+    if coupe and seat:
+        return f"купе {coupe}, место {seat}"
+    if seat:
+        return f"место {seat}"
+    if coupe:
+        return f"купе {coupe}"
+
     return None
+
 
 
 def _extract_when(text: str) -> Optional[str]:
