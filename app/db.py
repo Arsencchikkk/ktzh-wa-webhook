@@ -20,12 +20,16 @@ class MongoStore:
         self.sessions = None
         self.messages = None
         self.cases = None
+        self.enabled: bool = False  # ✅ для логов
 
     async def connect(self) -> None:
-        if not settings.MONGODB_URI:
-            raise RuntimeError("MONGO_URI is empty. Set it in Render ENV.")
+        uri = (settings.MONGODB_URI or "").strip()
+        if not uri:
+            # хочешь — можно raise, чтобы сервис падал и ты точно видел проблему
+            self.enabled = False
+            return
 
-        self.client = AsyncIOMotorClient(settings.MONGODB_URI)
+        self.client = AsyncIOMotorClient(uri)
         self.db = self.client[settings.DB_NAME]
 
         self.sessions = self.db[settings.COL_SESSIONS]
@@ -38,34 +42,43 @@ class MongoStore:
         await self.messages.create_index([("chatIdHash", ASCENDING), ("createdAt", ASCENDING)])
         await self.cases.create_index([("chatIdHash", ASCENDING), ("status", ASCENDING), ("type", ASCENDING)])
 
+        self.enabled = True
+
     async def close(self) -> None:
         if self.client is not None:
             self.client.close()
             self.client = None
 
     async def get_session(self, chat_id_hash: str) -> Optional[Dict[str, Any]]:
+        if not self.enabled:
+            return None
         return await self.sessions.find_one({"chatIdHash": chat_id_hash})
 
     async def save_session(self, chat_id_hash: str, session: Dict[str, Any]) -> None:
-        doc = dict(session)
-        doc.pop("_id", None)  # ✅ критично
-        doc["chatIdHash"] = chat_id_hash
-        doc["updatedAt"] = utcnow().isoformat()
-        doc.setdefault("createdAt", utcnow().isoformat())
+        if not self.enabled:
+            return
+        session = dict(session)
+        session["chatIdHash"] = chat_id_hash
+        session["updatedAt"] = utcnow().isoformat()
+        session.setdefault("createdAt", utcnow().isoformat())
 
         await self.sessions.update_one(
             {"chatIdHash": chat_id_hash},
-            {"$set": doc, "$setOnInsert": {"createdAt": doc["createdAt"]}},
+            {"$set": session, "$setOnInsert": {"createdAt": session["createdAt"]}},
             upsert=True,
         )
 
     async def add_message(self, doc: Dict[str, Any]) -> None:
-        d = dict(doc)
-        d.setdefault("createdAt", utcnow().isoformat())
-        await self.messages.insert_one(d)
+        if not self.enabled:
+            return
+        doc = dict(doc)
+        doc.setdefault("createdAt", utcnow().isoformat())
+        await self.messages.insert_one(doc)
 
     async def create_case(self, doc: Dict[str, Any]) -> None:
-        d = dict(doc)
-        d.setdefault("createdAt", utcnow().isoformat())
-        d.setdefault("updatedAt", utcnow().isoformat())
-        await self.cases.insert_one(d)
+        if not self.enabled:
+            return
+        doc = dict(doc)
+        doc.setdefault("createdAt", utcnow().isoformat())
+        doc.setdefault("updatedAt", utcnow().isoformat())
+        await self.cases.insert_one(doc)
