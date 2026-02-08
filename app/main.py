@@ -34,7 +34,6 @@ async def startup():
 @app.on_event("shutdown")
 async def shutdown():
     await store.close()
-    # если у WazzupClient нет close() — убери следующую строку или добавь метод
     if hasattr(wazzup, "close"):
         await wazzup.close()
 
@@ -44,19 +43,64 @@ def chat_hash(chat_id: str) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def _check_token(request: Request) -> None:
+    if settings.WEBHOOK_TOKEN:
+        token = request.query_params.get("token") or request.query_params.get("crmKey")
+        if token != settings.WEBHOOK_TOKEN:
+            raise HTTPException(status_code=401, detail="Invalid webhook token")
+
+
+def _payload_to_items(payload: Any) -> List[Dict[str, Any]]:
+    """
+    Wazzup может прислать:
+    - {"messages":[...]}
+    - {"statuses":[...]}
+    - single message dict
+    - list of dicts / list of wrappers
+    Возвращаем ТОЛЬКО message dict'ы.
+    """
+    items: List[Dict[str, Any]] = []
+
+    if isinstance(payload, list):
+        for x in payload:
+            items.extend(_payload_to_items(x))
+        return items
+
+    if not isinstance(payload, dict):
+        return []
+
+    # wrappers
+    if isinstance(payload.get("messages"), list):
+        return [m for m in payload["messages"] if isinstance(m, dict)]
+
+    if isinstance(payload.get("statuses"), list) or "statuses" in payload:
+        return []
+
+    # single message dict
+    return [payload]
+
+
 def extract_inbound(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    # на всякий случай — если сюда прилетела обёртка
+    """
+    Принимаем ТОЛЬКО один message dict (НЕ wrapper).
+    """
+    # statuses callbacks / wrapper сюда не должны попадать
     if "statuses" in payload or "messages" in payload:
         return None
 
+    # echo from our bot
     if payload.get("isEcho") is True:
         return None
 
+    # if direction exists and not inbound
     direction = payload.get("direction")
     if direction and direction != "inbound":
         return None
 
+    # ✅ Wazzup часто кладёт text прямо в корень
     text = payload.get("text")
+
+    # fallback legacy formats
     if not text:
         raw = payload.get("raw") or {}
         if isinstance(raw, dict):
@@ -80,47 +124,6 @@ def extract_inbound(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 
-def _check_token(request: Request) -> None:
-    if settings.WEBHOOK_TOKEN:
-        token = request.query_params.get("token") or request.query_params.get("crmKey")
-        if token != settings.WEBHOOK_TOKEN:
-            raise HTTPException(status_code=401, detail="Invalid webhook token")
-
-
-
-
-from typing import Any, Dict, List
-
-def _payload_to_items(payload: Any) -> List[Dict[str, Any]]:
-    """
-    Wazzup может прислать:
-    - {"messages":[...]}
-    - {"statuses":[...]}
-    - single message dict
-    - list of dicts / list of wrappers
-    """
-    items: List[Dict[str, Any]] = []
-
-    if isinstance(payload, list):
-        for x in payload:
-            if isinstance(x, dict) and isinstance(x.get("messages"), list):
-                items.extend([m for m in x["messages"] if isinstance(m, dict)])
-            elif isinstance(x, dict) and isinstance(x.get("statuses"), list):
-                continue
-            elif isinstance(x, dict):
-                items.append(x)
-        return items
-
-    if isinstance(payload, dict):
-        if isinstance(payload.get("messages"), list):
-            return [m for m in payload["messages"] if isinstance(m, dict)]
-        if isinstance(payload.get("statuses"), list) or "statuses" in payload:
-            return []
-        return [payload]
-
-    return []
-
-
 @app.get("/")
 def root():
     return {"ok": True, "service": settings.APP_NAME}
@@ -131,21 +134,37 @@ def health():
     return {"ok": True}
 
 
-async def process_items(items: list) -> None:
+async def process_items(items: List[Dict[str, Any]]) -> None:
     log.info("WEBHOOK: got %s item(s)", len(items))
 
     for item in items:
-        if not isinstance(item, dict):
-            continue
-
         msg = extract_inbound(item)
+
         if not msg or not msg["chatId"]:
             log.info("SKIP: not inbound text payload keys=%s", list(item.keys())[:20])
             continue
 
+        # ✅ TEST MODE: обрабатываем/отвечаем только на один chatId (+ optional channelId)
+        if getattr(settings, "TEST_MODE", False):
+            allowed_chat = (getattr(settings, "TEST_CHAT_ID", "") or "").strip()
+            allowed_channel = (getattr(settings, "TEST_CHANNEL_ID", "") or "").strip()
+
+            if not allowed_chat:
+                log.warning("TEST_MODE enabled but TEST_CHAT_ID is empty -> skipping all")
+                continue
+
+            if msg["chatId"] != allowed_chat:
+                log.info("TEST_MODE: SKIP chatId=%s (allowed=%s)", msg["chatId"], allowed_chat)
+                continue
+
+            if allowed_channel and msg["channelId"] != allowed_channel:
+                log.info("TEST_MODE: SKIP channelId=%s (allowed=%s)", msg["channelId"], allowed_channel)
+                continue
+
         chat_id_hash = chat_hash(msg["chatId"])
         log.info("IN: chatId=%s text=%r", msg["chatId"], msg["text"])
 
+        # ✅ пишем входящее в Mongo (если включен store)
         await store.add_message({
             "dir": "in",
             "chatIdHash": chat_id_hash,
@@ -183,6 +202,7 @@ async def process_items(items: list) -> None:
             )
             log.info("SENT: %s", send_res)
 
+            # ✅ пишем исходящее
             await store.add_message({
                 "dir": "out",
                 "chatIdHash": chat_id_hash,
@@ -206,7 +226,7 @@ async def wazzup_webhook(request: Request, background: BackgroundTasks):
     payload = await request.json()
     items = _payload_to_items(payload)
 
-    # если пришли только statuses — просто 200 OK
+    # если пришли только statuses / wrappers — просто 200 OK
     if not items:
         return JSONResponse({"ok": True, "ignored": True})
 
