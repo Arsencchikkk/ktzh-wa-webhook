@@ -15,13 +15,28 @@ def normalize(text: str) -> str:
 def extract_train_and_car(text: str) -> Tuple[Optional[str], Optional[int]]:
     t = normalize(text)
 
-    train = None
-    car = None
+    train: Optional[str] = None
+    car: Optional[int] = None
 
+    # 1) Т58 / T58 / т 58
     m = re.search(r"\b[тt]\s*[-]?\s*(\d{1,4})\b", t)
     if m:
         train = f"Т{m.group(1)}"
 
+    # 2) поезд / № / цифры+буквы: 10ЦА, 81/82, 123А
+    if not train:
+        m = re.search(
+            r"(?:\bпоезд\b|\b№\b|\bn\b)?\s*"
+            r"\b(\d{2,4}(?:/\d{2,4})?[a-zа-я]{0,3})\b",
+            t,
+        )
+        if m:
+            cand = m.group(1).upper()
+            # защита: не спутать с "8 вагон"
+            if not re.fullmatch(r"\d{1,2}", cand):
+                train = cand
+
+    # вагон 9 / 9 вагон
     m = re.search(r"\bвагон\s*(\d{1,2})\b|\b(\d{1,2})\s*вагон\b", t)
     if m:
         num = next((g for g in m.groups() if g), None)
@@ -29,6 +44,7 @@ def extract_train_and_car(text: str) -> Tuple[Optional[str], Optional[int]]:
             car = int(num)
 
     return train, car
+
 
 
 def detect_aggression_and_flood(session: Dict[str, Any], text: str) -> Tuple[Dict[str, Any], bool, bool]:
