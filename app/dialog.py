@@ -69,7 +69,7 @@ def _extract_train_car_any(text: str) -> Tuple[Optional[str], Optional[int]]:
 
 def _is_train_car_only(text: str) -> bool:
     tn = normalize(text)
-    tr, car = _extract_train_car_any(text)  # ✅ оригинал, не tn
+    tr, car = _extract_train_car_any(text)  # ✅ оригинал
     tokens = re.findall(r"[a-zа-я0-9/]+", tn)
     if not tokens:
         return False
@@ -95,6 +95,13 @@ def _is_generic_gratitude(text: str) -> bool:
     tn = normalize(text)
     generic = ("хочу поблагодарить", "хочу сказать спасибо", "у меня благодарность", "благодарность", "спасибо")
     return any(g in tn for g in generic) and len(tn.split()) <= 6
+
+
+def _is_delay_complaint(text: str) -> bool:
+    tn = normalize(text)
+    if any(k in tn for k in ("опозд", "опазд", "задерж")):
+        return True
+    return bool(re.search(r"\bна\s*\d+\s*(час|ч|минут|мин)\b", tn))
 
 
 def _extract_place(text: str) -> Optional[str]:
@@ -131,23 +138,32 @@ def _extract_place(text: str) -> Optional[str]:
 
 def _extract_when(text: str) -> Optional[str]:
     tn = normalize(text)
-    if "сегодня" in tn:
-        return "сегодня"
-    if "вчера" in tn:
-        return "вчера"
-    if "позавчера" in tn:
-        return "позавчера"
 
+    day = None
+    if "сегодня" in tn:
+        day = "сегодня"
+    elif "вчера" in tn:
+        day = "вчера"
+    elif "позавчера" in tn:
+        day = "позавчера"
+
+    date = None
     m = re.search(r"\b(\d{1,2})[.\-/](\d{1,2})(?:[.\-/](\d{2,4}))?\b", tn)
     if m:
         d, mo, y = m.group(1), m.group(2), m.group(3)
-        return f"{d.zfill(2)}.{mo.zfill(2)}.{y}" if y else f"{d.zfill(2)}.{mo.zfill(2)}"
+        date = f"{d.zfill(2)}.{mo.zfill(2)}.{y}" if y else f"{d.zfill(2)}.{mo.zfill(2)}"
 
+    tm = None
     m = re.search(r"\b(\d{1,2}):(\d{2})\b", tn)
     if m:
-        return f"{m.group(1).zfill(2)}:{m.group(2)}"
+        tm = f"{m.group(1).zfill(2)}:{m.group(2)}"
 
-    return None
+    # склеиваем если есть
+    if day and tm:
+        return f"{day} {tm}"
+    if date and tm:
+        return f"{date} {tm}"
+    return day or date or tm
 
 
 def _extract_item(text: str) -> Optional[str]:
@@ -185,16 +201,6 @@ def _split_123(text: str) -> Dict[str, str]:
         out["3"] = m3.group(1).strip()
 
     return out
-
-
-def _required_slots(case_type: str) -> List[str]:
-    if case_type == "lost":
-        return ["train", "car", "place", "item", "when"]
-    if case_type == "complaint":
-        return ["train", "car", "complaintText"]
-    if case_type == "gratitude":
-        return ["train", "car", "gratitudeText"]
-    return []
 
 
 def _case_title(case_type: str) -> str:
@@ -257,14 +263,13 @@ class DialogManager:
             "3) Маршрут (откуда–куда):\n"
             "4) Дата поездки (дд.мм.гггг):\n"
             "5) Время/примерно когда:\n"
-            "6) Вагон №:\n"
+            "6) Вагон № (если относится к вагону):\n"
             "7) Место/купе (если есть):\n"
             "8) Детали обращения (2–4 предложения):\n"
         )
         if case_type == "lost":
             return base.replace("8) Детали обращения", "8) Что потеряли + приметы (цвет/марка) и где оставили")
         return base
-    # ==============================
 
     def _get_or_create_case(self, session: Dict[str, Any], case_type: str) -> Dict[str, Any]:
         for c in session["cases"]:
@@ -278,7 +283,11 @@ class DialogManager:
                 "place": None,
                 "item": None,
                 "when": None,
+
                 "complaintText": None,
+                "complaintTopic": None,   # "delay" | "service"
+                "complaintWhen": None,    # дата/время (для delay)
+
                 "gratitudeText": None,
                 "staffName": None,
             },
@@ -333,12 +342,14 @@ class DialogManager:
         shared = session["shared"]
         cs = case["slots"]
 
-        # поезд+вагон всегда обязательны
-        if not shared.get("train") or not shared.get("car"):
+        # train обязателен всегда
+        if not shared.get("train"):
             return False
 
-        # ✅ LOST: если есть минимум 2 из 3 — оформляем (как ты просил)
+        # ✅ LOST: train+car + минимум 2 из 3 (место/вещь/когда)
         if case["type"] == "lost":
+            if not shared.get("car"):
+                return False
             filled = 0
             if cs.get("place"):
                 filled += 1
@@ -348,15 +359,22 @@ class DialogManager:
                 filled += 1
             return filled >= 2
 
-        # остальное — строго
-        for s in _required_slots(case["type"]):
-            if s == "train" and not shared.get("train"):
+        # ✅ COMPLAINT: если delay — вагон не нужен, но нужен complaintWhen
+        if case["type"] == "complaint":
+            topic = cs.get("complaintTopic") or "service"
+            if not cs.get("complaintText"):
                 return False
-            if s == "car" and not shared.get("car"):
-                return False
-            if s in cs and not cs.get(s):
-                return False
-        return True
+
+            if topic == "delay":
+                return bool(cs.get("complaintWhen"))
+            # service / wagon-related
+            return bool(shared.get("car"))
+
+        # ✅ GRATITUDE: train+car+text
+        if case["type"] == "gratitude":
+            return bool(shared.get("car")) and bool(cs.get("gratitudeText"))
+
+        return False
 
     async def _submit_case(self, chat_id_hash: str, session: Dict[str, Any], case: Dict[str, Any]) -> str:
         case_id = _gen_case_id("KTZH", chat_id_hash)
@@ -421,7 +439,7 @@ class DialogManager:
 
             parts = _split_123(text)
 
-            # ✅ LOST: если пришло "1) 2) 3)" — берём прямо оттуда
+            # ✅ LOST: формат 1)/2)/3)
             if case_type == "lost" and parts:
                 p1 = parts.get("1", "")
                 p2 = parts.get("2", "")
@@ -434,7 +452,6 @@ class DialogManager:
                         changed = True
 
                 if "item" in slots and not cs.get("item"):
-                    # ✅ item берём как есть из блока 2) — без ключевых слов
                     it = _short(p2) if p2 else (_extract_item(text) or None)
                     if it:
                         cs["item"] = it
@@ -446,7 +463,15 @@ class DialogManager:
                         cs["when"] = wh
                         changed = True
 
-            # обычные случаи / fallback
+            # ✅ complaintWhen (для delay)
+            if case_type == "complaint":
+                if "complaintWhen" in slots and not cs.get("complaintWhen"):
+                    wh = _extract_when(text)
+                    if wh:
+                        cs["complaintWhen"] = wh
+                        changed = True
+
+            # fallback обычный
             if "place" in slots and not cs.get("place"):
                 pl = _extract_place(text)
                 if pl:
@@ -475,6 +500,7 @@ class DialogManager:
                     cs["gratitudeText"] = _short(text)
                     changed = True
 
+            # ok check
             ok = True
             for sname in slots:
                 if sname == "train":
@@ -525,6 +551,7 @@ class DialogManager:
         shared = session["shared"]
         slots = getattr(nlu_res, "slots", {}) or {}
 
+        # apply NLU slots
         if slots.get("train") and not shared.get("train"):
             shared["train"] = slots["train"]
             self._loop_reset(session)
@@ -532,6 +559,7 @@ class DialogManager:
             shared["car"] = slots["car"]
             self._loop_reset(session)
 
+        # apply regex slots
         tr, car = _extract_train_car_any(text)
         if tr and not shared.get("train"):
             shared["train"] = tr
@@ -540,15 +568,30 @@ class DialogManager:
             shared["car"] = car
             self._loop_reset(session)
 
+        # create cases
         for it in intents:
             self._get_or_create_case(session, it)
 
+        # ===== complaint fill + topic + when =====
         if "complaint" in intents:
             ccase = self._get_or_create_case(session, "complaint")
+
             if not ccase["slots"].get("complaintText"):
                 if (not _is_train_car_only(text)) and (not _is_generic_complaint(text)):
                     ccase["slots"]["complaintText"] = _short(text)
 
+            # topic — по самому complaintText (если есть), иначе по текущему сообщению
+            base_text = ccase["slots"].get("complaintText") or text
+            if not ccase["slots"].get("complaintTopic"):
+                ccase["slots"]["complaintTopic"] = "delay" if _is_delay_complaint(base_text) else "service"
+
+            # для delay — пробуем сразу вытащить когда
+            if ccase["slots"].get("complaintTopic") == "delay" and not ccase["slots"].get("complaintWhen"):
+                wh = _extract_when(text)
+                if wh:
+                    ccase["slots"]["complaintWhen"] = wh
+
+        # ===== gratitude fill =====
         if "gratitude" in intents:
             gcase = self._get_or_create_case(session, "gratitude")
             if not gcase["slots"].get("gratitudeText"):
@@ -557,12 +600,12 @@ class DialogManager:
             if slots.get("staffName") and not gcase["slots"].get("staffName"):
                 gcase["slots"]["staffName"] = str(slots["staffName"])
 
+        # ===== lost fill =====
         if "lost" in intents:
             lcase = self._get_or_create_case(session, "lost")
 
             parts = _split_123(text)
             if parts:
-                # ✅ если клиент дал 1)/2)/3) — сразу кладём
                 p1 = parts.get("1", "")
                 p2 = parts.get("2", "")
                 p3 = parts.get("3", "")
@@ -581,15 +624,22 @@ class DialogManager:
                 if not lcase["slots"].get("when"):
                     lcase["slots"]["when"] = _extract_when(text)
 
+        # primary
         primary: Optional[str] = None
         for ct in ["lost", "complaint", "gratitude"]:
             if any(c["type"] == ct and c["status"] in ("open", "collecting") for c in session["cases"]):
                 primary = ct
                 break
 
+        # ===== ask train/car (но для delay не спрашиваем car) =====
         if primary:
             missing_train = not bool(shared.get("train"))
             missing_car = not bool(shared.get("car"))
+
+            if primary == "complaint":
+                ccase = self._get_or_create_case(session, "complaint")
+                if ccase["slots"].get("complaintTopic") == "delay":
+                    missing_car = False  # ✅ delay -> вагон не нужен
 
             if missing_train or missing_car:
                 cnt = self._loop_bump(session, "ask_train_car")
@@ -609,6 +659,7 @@ class DialogManager:
 
             self._loop_reset(session)
 
+        # ===== collect missing + submit =====
         for ct in ["lost", "complaint", "gratitude"]:
             for case in session["cases"]:
                 if case["type"] != ct or case["status"] not in ("open", "collecting"):
@@ -629,6 +680,8 @@ class DialogManager:
                         need.append("item")
                     if not cs.get("when"):
                         need.append("when")
+
+                    # ✅ важно: если уже есть 2 из 3 — мы не спрашиваем третье, т.к. _is_case_ready уже бы сработал
                     if need:
                         cnt = self._loop_bump(session, "ask_lost_bundle")
                         self._set_pending(session, scope="case", slots=need, case_type="lost")
@@ -642,6 +695,20 @@ class DialogManager:
                         return BotReply(text=self._lost_bundle_question(angry=(is_angry or is_flood)))
 
                 if ct == "complaint":
+                    topic = cs.get("complaintTopic") or "service"
+
+                    if topic == "delay" and not cs.get("complaintWhen"):
+                        cnt = self._loop_bump(session, "ask_complaint_when")
+                        self._set_pending(session, scope="case", slots=["complaintWhen"], case_type="complaint")
+
+                        if cnt >= 3:
+                            session["pending"] = None
+                            await self._save_session(chat_id_hash, session)
+                            return BotReply(text=self._ops_template("complaint"))
+
+                        await self._save_session(chat_id_hash, session)
+                        return BotReply(text="Уточните, пожалуйста, дату поездки и примерное время (например: вчера 19:00 или 01.02.2026 18:30).")
+
                     if not cs.get("complaintText"):
                         cnt = self._loop_bump(session, "ask_complaint_text")
                         self._set_pending(session, scope="case", slots=["complaintText"], case_type="complaint")
