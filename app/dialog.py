@@ -707,7 +707,7 @@ class DialogManager:
                             return BotReply(text=self._ops_template("complaint"))
 
                         await self._save_session(chat_id_hash, session)
-                        return BotReply(text="Уточните, пожалуйста, дату поездки и примерное время (например: вчера 19:00 или 01.02.2026 18:30).")
+                        return BotReply(text="Уточните, пожалуйста, Номер Поезда и дату поездки и примерное время (например: вчера 19:00 или 01.02.2026 18:30).")
 
                     if not cs.get("complaintText"):
                         cnt = self._loop_bump(session, "ask_complaint_text")
