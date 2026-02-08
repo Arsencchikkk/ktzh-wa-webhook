@@ -89,44 +89,37 @@ def _check_token(request: Request) -> None:
 
 
 
+from typing import Any, Dict, List
+
 def _payload_to_items(payload: Any) -> List[Dict[str, Any]]:
     """
     Wazzup может прислать:
     - {"messages":[...]}
     - {"statuses":[...]}
     - single message dict
-    - list of dicts (иногда внутри {"messages":[...]} или просто message dicts)
+    - list of dicts / list of wrappers
     """
     items: List[Dict[str, Any]] = []
 
-    def add_messages_from(obj: Any) -> None:
-        if not isinstance(obj, dict):
-            return
-
-        # 1) batch messages
-        msgs = obj.get("messages")
-        if isinstance(msgs, list):
-            items.extend([m for m in msgs if isinstance(m, dict)])
-            return
-
-        # 2) statuses -> ignore
-        sts = obj.get("statuses")
-        if isinstance(sts, list) or isinstance(sts, dict):
-            return
-
-        # 3) single message-like dict
-        items.append(obj)
-
     if isinstance(payload, list):
         for x in payload:
-            add_messages_from(x)
+            if isinstance(x, dict) and isinstance(x.get("messages"), list):
+                items.extend([m for m in x["messages"] if isinstance(m, dict)])
+            elif isinstance(x, dict) and isinstance(x.get("statuses"), list):
+                continue
+            elif isinstance(x, dict):
+                items.append(x)
         return items
 
     if isinstance(payload, dict):
-        add_messages_from(payload)
-        return items
+        if isinstance(payload.get("messages"), list):
+            return [m for m in payload["messages"] if isinstance(m, dict)]
+        if isinstance(payload.get("statuses"), list) or "statuses" in payload:
+            return []
+        return [payload]
 
     return []
+
 
 @app.get("/")
 def root():
