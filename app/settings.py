@@ -53,6 +53,10 @@ class Settings:
     MAX_HISTORY: int = env_int("MAX_HISTORY", 20)
     FLOOD_WINDOW_SEC: int = env_int("FLOOD_WINDOW_SEC", 8)
     FLOOD_MAX_MSG: int = env_int("FLOOD_MAX_MSG", 4)
+   TEST_MODE: bool = env_bool("TEST_MODE", False)
+   TEST_CHAT_ID: str = env_str("TEST_CHAT_ID", "")
+   TEST_CHANNEL_ID: str = env_str("TEST_CHANNEL_ID", "")  # optional
+
 
 
 settings = Settings()
