@@ -212,7 +212,6 @@ def _case_title(case_type: str) -> str:
 
 def _is_new_case_command(text: str) -> bool:
     tn = normalize(text)
-    # минимально — чтобы пользователь мог явно сказать, что хочет новый тикет
     keys = (
         "новая заявка",
         "новое обращение",
@@ -229,11 +228,12 @@ def _is_followup_noise(text: str) -> bool:
     tn = normalize(text).strip()
     if not tn:
         return True
+    if _is_train_car_only(text):
+        return True
     if tn in {"?", "??", "???", "!", "!!", "...", "…"}:
         return True
     if tn in {"ок", "понял", "ясно", "я же написал", "я написал"}:
         return True
-    # если почти нет букв/цифр
     alnum = re.sub(r"[^a-zа-я0-9]+", "", tn)
     return len(alnum) <= 2
 
@@ -407,7 +407,6 @@ class DialogManager:
                 "chatIdHash": chat_id_hash,
                 "type": case["type"],
                 "status": "open",
-                # ✅ followups держим в cases (MongoStore.create_case уже делает payload.followups=[], но оставим тут тоже)
                 "payload": {"shared": session.get("shared"), "slots": case.get("slots"), "followups": []},
             })
 
@@ -530,7 +529,6 @@ class DialogManager:
                     self._loop_reset(session)
 
     async def _get_last_open_case_id(self, chat_id_hash: str, session: Dict[str, Any]) -> Optional[str]:
-        # 1) из Mongo cases (истина)
         if hasattr(self.store, "get_last_open_case"):
             try:
                 doc = await self.store.get_last_open_case(chat_id_hash)  # type: ignore[attr-defined]
@@ -539,7 +537,6 @@ class DialogManager:
             except Exception as e:
                 log.warning("get_last_open_case failed: %s", e)
 
-        # 2) fallback из session (если без стора)
         for c in (session.get("cases") or []):
             if c.get("status") == "open" and c.get("caseId"):
                 return str(c.get("caseId"))
@@ -583,7 +580,7 @@ class DialogManager:
         # ✅ узнаём заранее: есть ли уже OPEN-заявка (для follow-up и приветствия)
         open_case_id = await self._get_last_open_case_id(chat_id_hash, session)
 
-        # ✅ явная команда "новая заявка" — не дописываем в старую
+        # ✅ явная команда "новая заявка" — НЕ дописываем в старую
         if _is_new_case_command(text):
             self._reset_dialog(session)
             await self._save_session(chat_id_hash, session)
@@ -604,7 +601,7 @@ class DialogManager:
             await self._save_session(chat_id_hash, session)
             return BotReply(text="Ок, остановил. Начнём заново — напишите, что случилось.")
 
-        # ✅ если пользователь просто поздоровался, но есть открытая заявка — НЕ запускаем сбор новой
+        # ✅ greeting при open заявке
         if getattr(nlu_res, "greeting_only", False) and open_case_id:
             await self._save_session(chat_id_hash, session)
             return BotReply(
@@ -615,10 +612,33 @@ class DialogManager:
                 )
             )
 
+        # ✅ если мы в процессе сбора (pending) — применяем ответы
         if session.get("pending"):
             self._apply_pending(session, text)
 
-        # обычное приветствие, только если НЕТ cases в диалоге и НЕТ open заявки
+        # ✅ FOLLOW-UP к открытой заявке: РАНО, ДО intents
+        # Условия:
+        # - есть open_case_id
+        # - мы НЕ собираем новую заявку (нет collecting) и нет pending
+        # - пользователь не сказал "новая заявка" (это выше)
+        if open_case_id and not session.get("pending") and not self._has_collecting_cases(session):
+            if _is_followup_noise(text):
+                await self._save_session(chat_id_hash, session)
+                return BotReply(
+                    text=(
+                        f"У вас есть открытая заявка {open_case_id}.\n"
+                        "Если хотите дополнить — напишите детали одним сообщением (что произошло / где / когда).\n"
+                        "Если нужна новая заявка — напишите «новая заявка»."
+                    )
+                )
+
+            ok = await self._append_followup(open_case_id, chat_meta, text)
+            await self._save_session(chat_id_hash, session)
+            if ok:
+                return BotReply(text=f"Добавил(а) дополнение к заявке {open_case_id}. Спасибо! Если есть ещё детали — напишите одним сообщением.")
+            return BotReply(text=f"Принял(а) дополнение по заявке {open_case_id}. Если есть ещё детали — напишите одним сообщением.")
+
+        # ✅ обычное приветствие (только если нет open заявки)
         if getattr(nlu_res, "greeting_only", False) and not session.get("cases") and not open_case_id:
             await self._save_session(chat_id_hash, session)
             return BotReply(text="Здравствуйте! Опишите проблему одним сообщением (опоздание / забытая вещь / жалоба / благодарность).")
@@ -807,33 +827,6 @@ class DialogManager:
 
                         await self._save_session(chat_id_hash, session)
                         return BotReply(text="Понял(а). Напишите, пожалуйста, за что благодарите (1–2 предложения).")
-
-        # ============================
-        # ✅ FOLLOW-UP к открытой заявке
-        # ============================
-        # Если:
-        # - есть open_case_id
-        # - нет новых intents (то есть пользователь не начал новое обращение)
-        # - мы НЕ в режиме собирания новой заявки (нет collecting) и нет pending
-        # - сообщение не "только поезд/вагон" и не шум "?/ок/я же написал"
-        if open_case_id and not intents and not session.get("pending") and not self._has_collecting_cases(session):
-            if _is_followup_noise(text):
-                await self._save_session(chat_id_hash, session)
-                return BotReply(
-                    text=(
-                        f"У вас есть открытая заявка {open_case_id}.\n"
-                        "Если хотите дополнить — напишите детали одним сообщением (что произошло / где / когда).\n"
-                        "Если нужна новая заявка — напишите «новая заявка»."
-                    )
-                )
-
-            # даже если текст короткий (“Холодно”) — это полезное дополнение
-            ok = await self._append_followup(open_case_id, chat_meta, text)
-
-            await self._save_session(chat_id_hash, session)
-            if ok:
-                return BotReply(text=f"Добавил(а) дополнение к заявке {open_case_id}. Спасибо! Если есть ещё детали — напишите одним сообщением.")
-            return BotReply(text=f"Принял(а) дополнение по заявке {open_case_id}. Если есть ещё детали — напишите одним сообщением.")
 
         await self._save_session(chat_id_hash, session)
         return BotReply(text="Понял(а). Напишите детали одним сообщением, и я оформлю обращение.")
