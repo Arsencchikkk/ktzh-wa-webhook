@@ -7,7 +7,7 @@ import re
 import secrets
 import logging
 
-from .nlu import build_nlu, extract_train_and_car, detect_aggression_and_flood, normalize
+from .nlu import build_nlu, extract_train_and_flood, detect_aggression_and_flood, normalize
 
 log = logging.getLogger("ktzh")
 
@@ -225,10 +225,6 @@ def _is_new_case_command(text: str) -> bool:
 
 
 def _is_no_more_details(text: str) -> bool:
-    """
-    Пользователь говорит: "больше нечего добавить" / "нету" / "всё".
-    Важно: НЕ триггерить на "нету отопления" и т.п.
-    """
     tn = normalize(text).strip()
     if not tn:
         return False
@@ -243,7 +239,6 @@ def _is_no_more_details(text: str) -> bool:
         return True
 
     joined = " ".join(words)
-
     phrases = (
         "нечего добавить",
         "добавить нечего",
@@ -255,10 +250,7 @@ def _is_no_more_details(text: str) -> bool:
         "все сказал",
         "всё сказал",
     )
-    if len(words) <= 4 and any(p in joined for p in phrases):
-        return True
-
-    return False
+    return len(words) <= 4 and any(p in joined for p in phrases)
 
 
 def _is_followup_noise(text: str) -> bool:
@@ -294,14 +286,14 @@ class DialogManager:
                 "pending": None,
                 "moderation": {"prev_text": None, "repeat_count": 0, "last_ts": 0.0},
                 "loop": {"key": None, "count": 0},
-                "openSnooze": None,  # ✅ чтобы не спамить напоминаниями про open-заявку
+                "mode": "normal",  # ✅ normal | new_case (в new_case игнорим open-case followup)
                 "createdAt": _now_utc().isoformat(),
                 "updatedAt": _now_utc().isoformat(),
             }
         if "loop" not in s:
             s["loop"] = {"key": None, "count": 0}
-        if "openSnooze" not in s:
-            s["openSnooze"] = None
+        if "mode" not in s:
+            s["mode"] = "normal"
         return s
 
     async def _save_session(self, chat_id_hash: str, session: Dict[str, Any]) -> None:
@@ -322,33 +314,6 @@ class DialogManager:
 
     def _loop_reset(self, session: Dict[str, Any]) -> None:
         session["loop"] = {"key": None, "count": 0}
-
-    # ========== open-snooze ==========
-    def _is_open_snoozed(self, session: Dict[str, Any], open_case_id: str) -> bool:
-        s = session.get("openSnooze")
-        if not s or not isinstance(s, dict):
-            return False
-        if str(s.get("caseId") or "") != str(open_case_id):
-            return False
-        until = s.get("until")
-        if not until:
-            return False
-        try:
-            t = dt.datetime.fromisoformat(str(until))
-            return _now_utc() < t
-        except Exception:
-            return False
-
-    def _set_open_snooze(self, session: Dict[str, Any], open_case_id: str, hours: int = 12) -> None:
-        session["openSnooze"] = {
-            "caseId": str(open_case_id),
-            "until": (_now_utc() + dt.timedelta(hours=hours)).isoformat(),
-        }
-
-    def _clear_open_snooze(self, session: Dict[str, Any], open_case_id: str) -> None:
-        s = session.get("openSnooze")
-        if isinstance(s, dict) and str(s.get("caseId") or "") == str(open_case_id):
-            session["openSnooze"] = None
 
     def _ops_template(self, case_type: str) -> str:
         base = (
@@ -395,7 +360,6 @@ class DialogManager:
         session["shared"] = {"train": None, "car": None}
         session["cases"] = []
         session["pending"] = None
-        session["openSnooze"] = None
         self._loop_reset(session)
 
     def _close_all_cases(self, session: Dict[str, Any], reason: str) -> None:
@@ -632,10 +596,7 @@ class DialogManager:
             return False
 
     def _has_collecting_cases(self, session: Dict[str, Any]) -> bool:
-        for c in (session.get("cases") or []):
-            if c.get("status") == "collecting":
-                return True
-        return False
+        return any(c.get("status") == "collecting" for c in (session.get("cases") or []))
 
     async def handle(self, chat_id_hash: str, chat_meta: Dict[str, Any], user_text: str) -> BotReply:
         session = await self._load_session(chat_id_hash)
@@ -647,18 +608,20 @@ class DialogManager:
         text = user_text or ""
         tnorm = normalize(text)
 
-        # ✅ узнаём заранее: есть ли уже OPEN-заявка (для follow-up и приветствия)
         open_case_id = await self._get_last_open_case_id(chat_id_hash, session)
 
-        # ✅ явная команда "новая заявка" — НЕ дописываем в старую
+        # ✅ новая заявка: полный reset + режим new_case
         if _is_new_case_command(text):
             self._reset_dialog(session)
+            session["mode"] = "new_case"
             await self._save_session(chat_id_hash, session)
-            return BotReply(text="Ок. Напишите одним сообщением, что случилось (опоздание / забытая вещь / жалоба / благодарность).")
+            return BotReply(text="Ок. Начнём заново. Опишите одним сообщением, что случилось (опоздание / забытая вещь / жалоба / благодарность).")
 
+        # ✅ стоп/отмена: тоже reset + режим new_case (чтобы не дописывать в старую open заявку)
         if tnorm in {"стоп", "хватит", "отмена", "прекрати", "прекратите"}:
             self._close_all_cases(session, reason="user_cancel")
             self._reset_dialog(session)
+            session["mode"] = "new_case"
             await self._save_session(chat_id_hash, session)
             return BotReply(text="Ок, остановил. Начнём заново — напишите, что случилось.")
 
@@ -668,14 +631,12 @@ class DialogManager:
         if getattr(nlu_res, "cancel", False):
             self._close_all_cases(session, reason="user_cancel")
             self._reset_dialog(session)
+            session["mode"] = "new_case"
             await self._save_session(chat_id_hash, session)
             return BotReply(text="Ок, остановил. Начнём заново — напишите, что случилось.")
 
-        # ✅ greeting при open заявке (но если уже сказали "нечего добавить" — не напоминаем)
-        if getattr(nlu_res, "greeting_only", False) and open_case_id:
-            if self._is_open_snoozed(session, open_case_id):
-                await self._save_session(chat_id_hash, session)
-                return BotReply(text="Здравствуйте! Чем могу помочь?")
+        # ✅ greeting при open заявке ТОЛЬКО если НЕ new_case режим
+        if getattr(nlu_res, "greeting_only", False) and open_case_id and session.get("mode") != "new_case":
             await self._save_session(chat_id_hash, session)
             return BotReply(
                 text=(
@@ -685,27 +646,23 @@ class DialogManager:
                 )
             )
 
-        # ✅ если мы в процессе сбора (pending) — применяем ответы
+        # ✅ если pending — применяем ответы
         if session.get("pending"):
             self._apply_pending(session, text)
 
-        # ============================
-        # ✅ FOLLOW-UP к открытой заявке (не спамим)
-        # ============================
-        if open_case_id and not session.get("pending") and not self._has_collecting_cases(session):
-
-            # 1) "Нету/всё/нечего добавить" => закрываем тему и ставим snooze, без напоминаний
+        # ✅ FOLLOW-UP к open заявке ТОЛЬКО если НЕ new_case режим и нет процесса сбора
+        if (
+            open_case_id
+            and session.get("mode") != "new_case"
+            and not session.get("pending")
+            and not self._has_collecting_cases(session)
+        ):
+            # "больше нечего" => просто закрываем коммуникацию
             if _is_no_more_details(text):
-                self._set_open_snooze(session, open_case_id, hours=12)
                 await self._save_session(chat_id_hash, session)
                 return BotReply(text="Ок, понял. Спасибо! Если вспомните детали — напишите.")
 
-            # 2) если уже snooze и это шум — отвечаем коротко, без напоминаний
-            if self._is_open_snoozed(session, open_case_id) and _is_followup_noise(text):
-                await self._save_session(chat_id_hash, session)
-                return BotReply(text="Ок.")
-
-            # 3) обычный шум — можно один раз напомнить (но без спама)
+            # шум
             if _is_followup_noise(text):
                 await self._save_session(chat_id_hash, session)
                 return BotReply(
@@ -715,21 +672,22 @@ class DialogManager:
                     )
                 )
 
-            # 4) нормальный текст => это дополнение
-            self._clear_open_snooze(session, open_case_id)
             ok = await self._append_followup(open_case_id, chat_meta, text)
             await self._save_session(chat_id_hash, session)
             if ok:
                 return BotReply(text=f"Добавил(а) дополнение к заявке {open_case_id}. Спасибо!")
             return BotReply(text=f"Принял(а) дополнение по заявке {open_case_id}. Спасибо!")
 
-        # ✅ обычное приветствие (только если нет open заявки)
-        if getattr(nlu_res, "greeting_only", False) and not session.get("cases") and not open_case_id:
+        # ✅ обычное приветствие (если нет open или если мы в режиме new_case)
+        if getattr(nlu_res, "greeting_only", False) and (not session.get("cases")):
             await self._save_session(chat_id_hash, session)
             return BotReply(text="Здравствуйте! Опишите проблему одним сообщением (опоздание / забытая вещь / жалоба / благодарность).")
 
-        # дальше — стандартная логика создания/сбора новых заявок
         intents: List[str] = list(getattr(nlu_res, "intents", []) or [])
+
+        # ✅ если пользователь в режиме new_case и начал реальную заявку — выключаем режим
+        if session.get("mode") == "new_case" and intents:
+            session["mode"] = "normal"
 
         shared = session["shared"]
         slots = getattr(nlu_res, "slots", {}) or {}
@@ -823,6 +781,10 @@ class DialogManager:
                     missing_car = False
 
             if missing_train or missing_car:
+                # ✅ как только мы реально начали сбор новой заявки — выключаем режим new_case
+                if session.get("mode") == "new_case":
+                    session["mode"] = "normal"
+
                 cnt = self._loop_bump(session, "ask_train_car")
                 self._set_pending(
                     session,
@@ -848,6 +810,7 @@ class DialogManager:
 
                 if self._is_case_ready(session, case) and case["status"] != "open":
                     case_id = await self._submit_case(chat_id_hash, session, case)
+                    session["mode"] = "normal"
                     await self._save_session(chat_id_hash, session)
                     return BotReply(text=f"Принял(а) ваше обращение: «{_case_title(ct)}». Номер заявки: {case_id}.")
 
@@ -863,6 +826,9 @@ class DialogManager:
                         need.append("when")
 
                     if need:
+                        if session.get("mode") == "new_case":
+                            session["mode"] = "normal"
+
                         cnt = self._loop_bump(session, "ask_lost_bundle")
                         self._set_pending(session, scope="case", slots=need, case_type="lost")
 
@@ -878,6 +844,9 @@ class DialogManager:
                     topic = cs.get("complaintTopic") or "service"
 
                     if topic == "delay" and not cs.get("complaintWhen"):
+                        if session.get("mode") == "new_case":
+                            session["mode"] = "normal"
+
                         cnt = self._loop_bump(session, "ask_complaint_when")
                         self._set_pending(session, scope="case", slots=["complaintWhen"], case_type="complaint")
 
@@ -890,6 +859,9 @@ class DialogManager:
                         return BotReply(text="Уточните, пожалуйста, номер поезда, дату поездки и примерное время (например: вчера 19:00 или 01.02.2026 18:30).")
 
                     if not cs.get("complaintText"):
+                        if session.get("mode") == "new_case":
+                            session["mode"] = "normal"
+
                         cnt = self._loop_bump(session, "ask_complaint_text")
                         self._set_pending(session, scope="case", slots=["complaintText"], case_type="complaint")
 
@@ -903,6 +875,9 @@ class DialogManager:
 
                 if ct == "gratitude":
                     if not cs.get("gratitudeText"):
+                        if session.get("mode") == "new_case":
+                            session["mode"] = "normal"
+
                         cnt = self._loop_bump(session, "ask_gratitude_text")
                         self._set_pending(session, scope="case", slots=["gratitudeText"], case_type="gratitude")
 
