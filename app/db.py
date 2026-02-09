@@ -6,7 +6,7 @@ import logging
 import secrets
 
 from motor.motor_asyncio import AsyncIOMotorClient
-from pymongo import ASCENDING
+from pymongo import ASCENDING, DESCENDING
 from pymongo.errors import OperationFailure
 
 from .settings import settings
@@ -100,6 +100,15 @@ class MongoStore:
             [("chatIdHash", ASCENDING), ("status", ASCENDING), ("type", ASCENDING)],
         )
 
+        # ✅ быстрый поиск последней open-заявки
+        await self._ensure_index(
+            self.cases,
+            [("chatIdHash", ASCENDING), ("status", ASCENDING), ("updatedAt", DESCENDING)],
+        )
+
+        # ✅ (опционально, но очень желательно) уникальный caseId
+        await self._ensure_index(self.cases, [("caseId", ASCENDING)], unique=True)
+
         self.enabled = True
 
     async def close(self) -> None:
@@ -158,6 +167,54 @@ class MongoStore:
                     f"{secrets.token_hex(3).upper()}"
                 )
 
+        # ✅ гарантируем структуру payload
+        payload = d.get("payload") or {}
+        if not isinstance(payload, dict):
+            payload = {}
+        payload.setdefault("followups", [])
+        d["payload"] = payload
+
         d.setdefault("createdAt", utcnow().isoformat())
         d.setdefault("updatedAt", utcnow().isoformat())
         await self.cases.insert_one(d)
+
+    async def get_last_open_case(self, chat_id_hash: str) -> Optional[Dict[str, Any]]:
+        """
+        Возвращает последнюю открытую заявку (status='open') по chatIdHash.
+        Берём самую свежую по updatedAt (fallback createdAt).
+        """
+        if not self.enabled:
+            return None
+
+        return await self.cases.find_one(
+            {"chatIdHash": chat_id_hash, "status": "open"},
+            sort=[("updatedAt", DESCENDING), ("createdAt", DESCENDING)],
+        )
+
+    async def append_case_followup(self, case_id: str, note: Dict[str, Any]) -> bool:
+        """
+        Добавляет дополнение (follow-up) в payload.followups[] и обновляет updatedAt.
+
+        note обычно:
+          {"ts": "...iso...", "text": "...", "meta": {...optional...}}
+        """
+        if not self.enabled:
+            return False
+
+        n = dict(note or {})
+        n.setdefault("ts", utcnow().isoformat())
+        n.setdefault("text", "")
+
+        res = await self.cases.update_one(
+            {"caseId": case_id},
+            {
+                "$push": {"payload.followups": n},
+                "$set": {"updatedAt": utcnow().isoformat()},
+            },
+        )
+
+        if res.matched_count == 0:
+            log.warning("append_case_followup: case not found: %s", case_id)
+            return False
+
+        return True
