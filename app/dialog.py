@@ -69,7 +69,7 @@ def _extract_train_car_any(text: str) -> Tuple[Optional[str], Optional[int]]:
 
 def _is_train_car_only(text: str) -> bool:
     tn = normalize(text)
-    tr, car = _extract_train_car_any(text)  # ✅ оригинал
+    tr, car = _extract_train_car_any(text)
     tokens = re.findall(r"[a-zа-я0-9/]+", tn)
     if not tokens:
         return False
@@ -87,7 +87,14 @@ def _is_train_car_only(text: str) -> bool:
 
 def _is_generic_complaint(text: str) -> bool:
     tn = normalize(text)
-    generic = ("хочу пожаловаться", "хочу жалобу", "хочу оставить жалобу", "у меня жалоба", "жалоба", "пожаловаться")
+    generic = (
+        "хочу пожаловаться",
+        "хочу жалобу",
+        "хочу оставить жалобу",
+        "у меня жалоба",
+        "жалоба",
+        "пожаловаться",
+    )
     return any(g in tn for g in generic) and len(tn.split()) <= 6
 
 
@@ -158,7 +165,6 @@ def _extract_when(text: str) -> Optional[str]:
     if m:
         tm = f"{m.group(1).zfill(2)}:{m.group(2)}"
 
-    # склеиваем если есть
     if day and tm:
         return f"{day} {tm}"
     if date and tm:
@@ -172,19 +178,12 @@ def _extract_item(text: str) -> Optional[str]:
         "сумк", "рюкзак", "чемодан", "пакет",
         "телефон", "документ", "паспорт",
         "кошелек", "бумажник", "наушник", "ноутбук",
-        # ✅ одежда и частые вещи
         "кофт", "куртк", "одежд", "футболк", "штан", "джинс", "пальт", "шапк",
     )
     return _short(text) if any(k in tn for k in keys) else None
 
 
 def _split_123(text: str) -> Dict[str, str]:
-    """
-    Парсим форматы:
-      1) ...
-      2) ...
-      3) ...
-    """
     s = (text or "").strip()
     out: Dict[str, str] = {}
 
@@ -209,6 +208,34 @@ def _case_title(case_type: str) -> str:
         "complaint": "Жалоба",
         "gratitude": "Благодарность",
     }.get(case_type, case_type)
+
+
+def _is_new_case_command(text: str) -> bool:
+    tn = normalize(text)
+    # минимально — чтобы пользователь мог явно сказать, что хочет новый тикет
+    keys = (
+        "новая заявка",
+        "новое обращение",
+        "новый тикет",
+        "новая жалоба",
+        "создай новую",
+        "начать заново",
+        "новая",
+    )
+    return any(k in tn for k in keys)
+
+
+def _is_followup_noise(text: str) -> bool:
+    tn = normalize(text).strip()
+    if not tn:
+        return True
+    if tn in {"?", "??", "???", "!", "!!", "...", "…"}:
+        return True
+    if tn in {"ок", "понял", "ясно", "я же написал", "я написал"}:
+        return True
+    # если почти нет букв/цифр
+    alnum = re.sub(r"[^a-zа-я0-9]+", "", tn)
+    return len(alnum) <= 2
 
 
 class DialogManager:
@@ -283,11 +310,9 @@ class DialogManager:
                 "place": None,
                 "item": None,
                 "when": None,
-
                 "complaintText": None,
                 "complaintTopic": None,   # "delay" | "service"
                 "complaintWhen": None,    # дата/время (для delay)
-
                 "gratitudeText": None,
                 "staffName": None,
             },
@@ -328,7 +353,6 @@ class DialogManager:
             return f"{prefix}, напишите номер поезда (пример: Т58 или 10ЦА или 81/82 или ТЦ10)."
         if missing_car:
             return f"{prefix}, напишите номер вагона (пример: 7 вагон)."
-
         return f"{prefix}, уточните данные."
 
     def _lost_bundle_question(self, angry: bool = False) -> str:
@@ -342,11 +366,9 @@ class DialogManager:
         shared = session["shared"]
         cs = case["slots"]
 
-        # train обязателен всегда
         if not shared.get("train"):
             return False
 
-        # ✅ LOST: train+car + минимум 2 из 3 (место/вещь/когда)
         if case["type"] == "lost":
             if not shared.get("car"):
                 return False
@@ -359,18 +381,14 @@ class DialogManager:
                 filled += 1
             return filled >= 2
 
-        # ✅ COMPLAINT: если delay — вагон не нужен, но нужен complaintWhen
         if case["type"] == "complaint":
             topic = cs.get("complaintTopic") or "service"
             if not cs.get("complaintText"):
                 return False
-
             if topic == "delay":
                 return bool(cs.get("complaintWhen"))
-            # service / wagon-related
             return bool(shared.get("car"))
 
-        # ✅ GRATITUDE: train+car+text
         if case["type"] == "gratitude":
             return bool(shared.get("car")) and bool(cs.get("gratitudeText"))
 
@@ -389,7 +407,8 @@ class DialogManager:
                 "chatIdHash": chat_id_hash,
                 "type": case["type"],
                 "status": "open",
-                "payload": {"shared": session.get("shared"), "slots": case.get("slots")},
+                # ✅ followups держим в cases (MongoStore.create_case уже делает payload.followups=[], но оставим тут тоже)
+                "payload": {"shared": session.get("shared"), "slots": case.get("slots"), "followups": []},
             })
 
         self._loop_reset(session)
@@ -439,7 +458,6 @@ class DialogManager:
 
             parts = _split_123(text)
 
-            # ✅ LOST: формат 1)/2)/3)
             if case_type == "lost" and parts:
                 p1 = parts.get("1", "")
                 p2 = parts.get("2", "")
@@ -463,7 +481,6 @@ class DialogManager:
                         cs["when"] = wh
                         changed = True
 
-            # ✅ complaintWhen (для delay)
             if case_type == "complaint":
                 if "complaintWhen" in slots and not cs.get("complaintWhen"):
                     wh = _extract_when(text)
@@ -471,7 +488,6 @@ class DialogManager:
                         cs["complaintWhen"] = wh
                         changed = True
 
-            # fallback обычный
             if "place" in slots and not cs.get("place"):
                 pl = _extract_place(text)
                 if pl:
@@ -500,7 +516,6 @@ class DialogManager:
                     cs["gratitudeText"] = _short(text)
                     changed = True
 
-            # ok check
             ok = True
             for sname in slots:
                 if sname == "train":
@@ -514,6 +529,47 @@ class DialogManager:
                 if changed:
                     self._loop_reset(session)
 
+    async def _get_last_open_case_id(self, chat_id_hash: str, session: Dict[str, Any]) -> Optional[str]:
+        # 1) из Mongo cases (истина)
+        if hasattr(self.store, "get_last_open_case"):
+            try:
+                doc = await self.store.get_last_open_case(chat_id_hash)  # type: ignore[attr-defined]
+                if doc and isinstance(doc, dict) and doc.get("caseId"):
+                    return str(doc["caseId"])
+            except Exception as e:
+                log.warning("get_last_open_case failed: %s", e)
+
+        # 2) fallback из session (если без стора)
+        for c in (session.get("cases") or []):
+            if c.get("status") == "open" and c.get("caseId"):
+                return str(c.get("caseId"))
+        return None
+
+    async def _append_followup(self, case_id: str, chat_meta: Dict[str, Any], text: str) -> bool:
+        if not hasattr(self.store, "append_case_followup"):
+            return False
+        try:
+            note = {
+                "ts": _now_utc().isoformat(),
+                "text": _short(text),
+                "meta": {
+                    "chatId": str(chat_meta.get("chatId") or ""),
+                    "chatType": str(chat_meta.get("chatType") or ""),
+                    "channelId": str(chat_meta.get("channelId") or ""),
+                },
+            }
+            ok = await self.store.append_case_followup(case_id, note)  # type: ignore[attr-defined]
+            return bool(ok)
+        except Exception as e:
+            log.warning("append_case_followup failed for %s: %s", case_id, e)
+            return False
+
+    def _has_collecting_cases(self, session: Dict[str, Any]) -> bool:
+        for c in (session.get("cases") or []):
+            if c.get("status") == "collecting":
+                return True
+        return False
+
     async def handle(self, chat_id_hash: str, chat_meta: Dict[str, Any], user_text: str) -> BotReply:
         session = await self._load_session(chat_id_hash)
 
@@ -523,6 +579,15 @@ class DialogManager:
 
         text = user_text or ""
         tnorm = normalize(text)
+
+        # ✅ узнаём заранее: есть ли уже OPEN-заявка (для follow-up и приветствия)
+        open_case_id = await self._get_last_open_case_id(chat_id_hash, session)
+
+        # ✅ явная команда "новая заявка" — не дописываем в старую
+        if _is_new_case_command(text):
+            self._reset_dialog(session)
+            await self._save_session(chat_id_hash, session)
+            return BotReply(text="Ок. Напишите одним сообщением, что случилось (опоздание / забытая вещь / жалоба / благодарность).")
 
         if tnorm in {"стоп", "хватит", "отмена", "прекрати", "прекратите"}:
             self._close_all_cases(session, reason="user_cancel")
@@ -539,10 +604,22 @@ class DialogManager:
             await self._save_session(chat_id_hash, session)
             return BotReply(text="Ок, остановил. Начнём заново — напишите, что случилось.")
 
+        # ✅ если пользователь просто поздоровался, но есть открытая заявка — НЕ запускаем сбор новой
+        if getattr(nlu_res, "greeting_only", False) and open_case_id:
+            await self._save_session(chat_id_hash, session)
+            return BotReply(
+                text=(
+                    f"Здравствуйте! У вас уже есть открытая заявка {open_case_id}.\n"
+                    "Если хотите дополнить её — напишите детали одним сообщением (что произошло / где / когда).\n"
+                    "Если нужна новая заявка — напишите «новая заявка»."
+                )
+            )
+
         if session.get("pending"):
             self._apply_pending(session, text)
 
-        if getattr(nlu_res, "greeting_only", False) and not session.get("cases"):
+        # обычное приветствие, только если НЕТ cases в диалоге и НЕТ open заявки
+        if getattr(nlu_res, "greeting_only", False) and not session.get("cases") and not open_case_id:
             await self._save_session(chat_id_hash, session)
             return BotReply(text="Здравствуйте! Опишите проблему одним сообщением (опоздание / забытая вещь / жалоба / благодарность).")
 
@@ -580,12 +657,10 @@ class DialogManager:
                 if (not _is_train_car_only(text)) and (not _is_generic_complaint(text)):
                     ccase["slots"]["complaintText"] = _short(text)
 
-            # topic — по самому complaintText (если есть), иначе по текущему сообщению
             base_text = ccase["slots"].get("complaintText") or text
             if not ccase["slots"].get("complaintTopic"):
                 ccase["slots"]["complaintTopic"] = "delay" if _is_delay_complaint(base_text) else "service"
 
-            # для delay — пробуем сразу вытащить когда
             if ccase["slots"].get("complaintTopic") == "delay" and not ccase["slots"].get("complaintWhen"):
                 wh = _extract_when(text)
                 if wh:
@@ -639,7 +714,7 @@ class DialogManager:
             if primary == "complaint":
                 ccase = self._get_or_create_case(session, "complaint")
                 if ccase["slots"].get("complaintTopic") == "delay":
-                    missing_car = False  # ✅ delay -> вагон не нужен
+                    missing_car = False
 
             if missing_train or missing_car:
                 cnt = self._loop_bump(session, "ask_train_car")
@@ -681,7 +756,6 @@ class DialogManager:
                     if not cs.get("when"):
                         need.append("when")
 
-                    # ✅ важно: если уже есть 2 из 3 — мы не спрашиваем третье, т.к. _is_case_ready уже бы сработал
                     if need:
                         cnt = self._loop_bump(session, "ask_lost_bundle")
                         self._set_pending(session, scope="case", slots=need, case_type="lost")
@@ -733,6 +807,33 @@ class DialogManager:
 
                         await self._save_session(chat_id_hash, session)
                         return BotReply(text="Понял(а). Напишите, пожалуйста, за что благодарите (1–2 предложения).")
+
+        # ============================
+        # ✅ FOLLOW-UP к открытой заявке
+        # ============================
+        # Если:
+        # - есть open_case_id
+        # - нет новых intents (то есть пользователь не начал новое обращение)
+        # - мы НЕ в режиме собирания новой заявки (нет collecting) и нет pending
+        # - сообщение не "только поезд/вагон" и не шум "?/ок/я же написал"
+        if open_case_id and not intents and not session.get("pending") and not self._has_collecting_cases(session):
+            if _is_followup_noise(text):
+                await self._save_session(chat_id_hash, session)
+                return BotReply(
+                    text=(
+                        f"У вас есть открытая заявка {open_case_id}.\n"
+                        "Если хотите дополнить — напишите детали одним сообщением (что произошло / где / когда).\n"
+                        "Если нужна новая заявка — напишите «новая заявка»."
+                    )
+                )
+
+            # даже если текст короткий (“Холодно”) — это полезное дополнение
+            ok = await self._append_followup(open_case_id, chat_meta, text)
+
+            await self._save_session(chat_id_hash, session)
+            if ok:
+                return BotReply(text=f"Добавил(а) дополнение к заявке {open_case_id}. Спасибо! Если есть ещё детали — напишите одним сообщением.")
+            return BotReply(text=f"Принял(а) дополнение по заявке {open_case_id}. Если есть ещё детали — напишите одним сообщением.")
 
         await self._save_session(chat_id_hash, session)
         return BotReply(text="Понял(а). Напишите детали одним сообщением, и я оформлю обращение.")
