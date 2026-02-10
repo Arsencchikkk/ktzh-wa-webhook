@@ -36,7 +36,7 @@ class MongoStore:
         Создаёт индекс только если такого key-pattern ещё нет.
         Не падает:
           - code 85: IndexOptionsConflict
-          - code 11000: duplicate key (например при unique индексе на старых данных)
+          - duplicate data при unique индексе (OperationFailure/DuplicateKeyError)
         """
         keys_norm = _keys_list(keys)
 
@@ -55,8 +55,13 @@ class MongoStore:
         # 2) пробуем создать
         try:
             await coll.create_index(keys, **opts)
+        except DuplicateKeyError as e:
+            log.warning("Mongo index create skipped (duplicate key) for %s on %s: %s", keys_norm, coll.name, e)
+            return
         except OperationFailure as e:
             code = getattr(e, "code", None)
+            # 85 = IndexOptionsConflict
+            # 11000 = duplicate key (E11000) при unique индексе на старых дублях
             if code in (85, 11000):
                 log.warning("Mongo index create skipped (code %s) for %s on %s: %s", code, keys_norm, coll.name, e)
                 return
@@ -83,7 +88,10 @@ class MongoStore:
         await self._ensure_index(self.cases, [("chatIdHash", ASCENDING), ("status", ASCENDING), ("type", ASCENDING)])
 
         # ✅ быстрый поиск последней open-заявки
-        await self._ensure_index(self.cases, [("chatIdHash", ASCENDING), ("status", ASCENDING), ("updatedAt", DESCENDING)])
+        await self._ensure_index(
+            self.cases,
+            [("chatIdHash", ASCENDING), ("status", ASCENDING), ("updatedAt", DESCENDING)],
+        )
 
         # ✅ уникальный caseId (не падаем при старых дублях)
         await self._ensure_index(self.cases, [("caseId", ASCENDING)], unique=True)
@@ -111,6 +119,7 @@ class MongoStore:
         doc["chatIdHash"] = chat_id_hash
         doc["updatedAt"] = utcnow().isoformat()
 
+        # 🔥 важно: createdAt не должен быть в $set (иначе конфликт с $setOnInsert)
         doc.pop("_id", None)
         doc.pop("createdAt", None)
 
@@ -129,6 +138,10 @@ class MongoStore:
         await self.messages.insert_one(d)
 
     async def create_case(self, doc: Dict[str, Any]) -> None:
+        """
+        Идемпотентное создание кейса.
+        КРИТИЧНО: updatedAt обновляем ТОЛЬКО через $set, чтобы не было code 40 conflict.
+        """
         if not self.enabled:
             return
 
@@ -149,17 +162,28 @@ class MongoStore:
         payload.setdefault("followups", [])
         d["payload"] = payload
 
-        d.setdefault("createdAt", utcnow().isoformat())
-        d.setdefault("updatedAt", utcnow().isoformat())
+        now = utcnow().isoformat()
+        created = d.get("createdAt") or now
 
-        # ✅ идемпотентно: если вдруг повторно пришёл create с тем же caseId — не падаем
+        # 🔥 убираем таймстампы из вставочного дока,
+        # чтобы updatedAt не конфликтовал между $setOnInsert и $set
+        d.pop("createdAt", None)
+        d.pop("updatedAt", None)
+
+        insert_doc = dict(d)
+        insert_doc["createdAt"] = created  # только onInsert
+
         try:
             await self.cases.update_one(
                 {"caseId": d["caseId"]},
-                {"$setOnInsert": d, "$set": {"updatedAt": utcnow().isoformat()}},
+                {
+                    "$setOnInsert": insert_doc,
+                    "$set": {"updatedAt": now},  # updatedAt только здесь (и при insert тоже сработает)
+                },
                 upsert=True,
             )
         except DuplicateKeyError as e:
+            # на случай гонок или кривых старых данных
             log.warning("create_case: duplicate key for caseId=%s: %s", d.get("caseId"), e)
 
     async def get_last_open_case(self, chat_id_hash: str) -> Optional[Dict[str, Any]]:
@@ -185,7 +209,10 @@ class MongoStore:
 
         res = await self.cases.update_one(
             {"caseId": case_id, "status": "open"},
-            {"$push": {"payload.followups": n}, "$set": {"updatedAt": utcnow().isoformat()}},
+            {
+                "$push": {"payload.followups": n},
+                "$set": {"updatedAt": utcnow().isoformat()},
+            },
         )
 
         if res.matched_count == 0:
