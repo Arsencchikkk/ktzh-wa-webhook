@@ -7,7 +7,9 @@ import re
 import secrets
 import logging
 
-from .nlu import build_nlu, extract_train_and_flood, detect_aggression_and_flood, normalize
+from .nlu import build_nlu, extract_train_and_car, detect_aggression_and_flood, normalize
+
+
 
 log = logging.getLogger("ktzh")
 
