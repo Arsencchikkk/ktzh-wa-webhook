@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, Optional, List, Tuple
 from datetime import datetime, timezone, timedelta
 import logging
+import secrets
 
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ASCENDING, DESCENDING, ReturnDocument
@@ -33,6 +34,8 @@ class MongoStore:
 
     async def _ensure_index(self, coll, keys: List[Tuple[str, int]], **opts) -> None:
         keys_norm = _keys_list(keys)
+
+        # 1) если индекс уже есть по key-pattern — ничего не делаем
         try:
             async for idx in coll.list_indexes():
                 existing = list(idx.get("key", {}).items())
@@ -44,6 +47,7 @@ class MongoStore:
         except Exception as e:
             log.warning("Mongo list_indexes failed for %s: %s", getattr(coll, "name", "unknown"), e)
 
+        # 2) создаём, но не падаем на конфликтах/дублях
         try:
             await coll.create_index(keys, **opts)
         except DuplicateKeyError as e:
@@ -51,6 +55,7 @@ class MongoStore:
             return
         except OperationFailure as e:
             code = getattr(e, "code", None)
+            # 85 = IndexOptionsConflict, 11000 = duplicate key
             if code in (85, 11000):
                 log.warning("Mongo index create skipped (code %s) for %s on %s: %s", code, keys_norm, coll.name, e)
                 return
@@ -68,21 +73,29 @@ class MongoStore:
         self.sessions = self.db[settings.COL_SESSIONS]
         self.messages = self.db[settings.COL_MESSAGES]
         self.cases = self.db[settings.COL_CASES]
-        self.ops_outbox = self.db[settings.COL_OPS_OUTBOX]
+
+        # optional outbox
+        col_outbox = getattr(settings, "COL_OPS_OUTBOX", None)
+        if col_outbox:
+            self.ops_outbox = self.db[col_outbox]
 
         await self.db.command("ping")
 
-        # sessions/messages/cases индексы (как у тебя)
+        # ---- индексы sessions/messages/cases ----
         await self._ensure_index(self.sessions, [("chatIdHash", ASCENDING)], unique=True)
         await self._ensure_index(self.messages, [("chatIdHash", ASCENDING), ("createdAt", ASCENDING)])
         await self._ensure_index(self.cases, [("chatIdHash", ASCENDING), ("status", ASCENDING), ("type", ASCENDING)])
-        await self._ensure_index(self.cases, [("chatIdHash", ASCENDING), ("status", ASCENDING), ("updatedAt", DESCENDING)])
+        await self._ensure_index(
+            self.cases,
+            [("chatIdHash", ASCENDING), ("status", ASCENDING), ("updatedAt", DESCENDING)],
+        )
         await self._ensure_index(self.cases, [("caseId", ASCENDING)], unique=True)
 
-        # ✅ outbox индексы
-        await self._ensure_index(self.ops_outbox, [("status", ASCENDING), ("nextAttemptAt", ASCENDING)])
-        await self._ensure_index(self.ops_outbox, [("lockUntil", ASCENDING)])
-        await self._ensure_index(self.ops_outbox, [("kind", ASCENDING), ("caseId", ASCENDING)], unique=True)
+        # ---- индексы outbox (если включён) ----
+        if self.ops_outbox is not None:
+            await self._ensure_index(self.ops_outbox, [("status", ASCENDING), ("nextAttemptAt", ASCENDING)])
+            await self._ensure_index(self.ops_outbox, [("lockUntil", ASCENDING)])
+            await self._ensure_index(self.ops_outbox, [("kind", ASCENDING), ("caseId", ASCENDING)], unique=True)
 
         self.enabled = True
 
@@ -91,6 +104,115 @@ class MongoStore:
             self.client.close()
             self.client = None
         self.enabled = False
+
+    # ---------- sessions ----------
+    async def get_session(self, chat_id_hash: str) -> Optional[Dict[str, Any]]:
+        if not self.enabled:
+            return None
+        return await self.sessions.find_one({"chatIdHash": chat_id_hash})
+
+    async def save_session(self, chat_id_hash: str, session: Dict[str, Any]) -> None:
+        if not self.enabled:
+            return
+
+        doc = dict(session)
+        created = doc.get("createdAt") or utcnow().isoformat()
+
+        doc["chatIdHash"] = chat_id_hash
+        doc["updatedAt"] = utcnow().isoformat()
+
+        # createdAt не должен быть в $set
+        doc.pop("_id", None)
+        doc.pop("createdAt", None)
+
+        await self.sessions.update_one(
+            {"chatIdHash": chat_id_hash},
+            {"$set": doc, "$setOnInsert": {"createdAt": created}},
+            upsert=True,
+        )
+
+    # ---------- messages ----------
+    async def add_message(self, doc: Dict[str, Any]) -> None:
+        if not self.enabled:
+            return
+        d = dict(doc)
+        d.pop("_id", None)
+        d.setdefault("createdAt", utcnow().isoformat())
+        await self.messages.insert_one(d)
+
+    # ---------- cases ----------
+    async def create_case(self, doc: Dict[str, Any]) -> None:
+        """
+        Идемпотентное создание кейса.
+        updatedAt обновляем ТОЛЬКО через $set.
+        """
+        if not self.enabled:
+            return
+
+        d = dict(doc)
+        d.pop("_id", None)
+
+        # гарантируем caseId
+        if not d.get("caseId"):
+            if d.get("ticketId"):
+                d["caseId"] = str(d["ticketId"])
+            else:
+                d["caseId"] = f"KTZH-{utcnow().strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(3).upper()}"
+
+        # гарантируем payload.followups
+        payload = d.get("payload") or {}
+        if not isinstance(payload, dict):
+            payload = {}
+        payload.setdefault("followups", [])
+        d["payload"] = payload
+
+        now = utcnow().isoformat()
+        created = d.get("createdAt") or now
+
+        d.pop("createdAt", None)
+        d.pop("updatedAt", None)
+
+        insert_doc = dict(d)
+        insert_doc["createdAt"] = created
+
+        try:
+            await self.cases.update_one(
+                {"caseId": d["caseId"]},
+                {
+                    "$setOnInsert": insert_doc,
+                    "$set": {"updatedAt": now},
+                },
+                upsert=True,
+            )
+        except DuplicateKeyError as e:
+            log.warning("create_case: duplicate key for caseId=%s: %s", d.get("caseId"), e)
+
+    async def get_last_open_case(self, chat_id_hash: str) -> Optional[Dict[str, Any]]:
+        if not self.enabled:
+            return None
+
+        return await self.cases.find_one(
+            {"chatIdHash": chat_id_hash, "status": "open"},
+            sort=[("updatedAt", DESCENDING), ("createdAt", DESCENDING)],
+        )
+
+    async def append_case_followup(self, case_id: str, note: Dict[str, Any]) -> bool:
+        if not self.enabled:
+            return False
+
+        n = dict(note or {})
+        n.setdefault("ts", utcnow().isoformat())
+        n.setdefault("text", "")
+
+        res = await self.cases.update_one(
+            {"caseId": case_id, "status": "open"},
+            {"$push": {"payload.followups": n}, "$set": {"updatedAt": utcnow().isoformat()}},
+        )
+
+        if res.matched_count == 0:
+            log.warning("append_case_followup: open case not found: %s", case_id)
+            return False
+        return True
 
     # ---------- outbox ----------
     async def enqueue_ops_outbox(
@@ -103,11 +225,7 @@ class MongoStore:
         source: Dict[str, Any],
         target: Dict[str, Any],
     ) -> None:
-        """
-        Идемпотентно кладём в ops_outbox.
-        Если запись уже есть — обновим text/target и снова поставим pending.
-        """
-        if not self.enabled:
+        if not self.enabled or self.ops_outbox is None:
             return
 
         now = utcnow().isoformat()
@@ -137,20 +255,21 @@ class MongoStore:
         )
 
     async def claim_pending_outbox(self) -> Optional[Dict[str, Any]]:
-        """
-        Забираем 1 pending задачу с учётом lockUntil/nextAttemptAt.
-        """
-        if not self.enabled:
+        if not self.enabled or self.ops_outbox is None:
             return None
 
         now_dt = utcnow()
         now = now_dt.isoformat()
-        lock_until = (now_dt + timedelta(seconds=int(settings.OPS_LOCK_SECONDS))).isoformat()
+
+        lock_seconds = int(getattr(settings, "OPS_LOCK_SECONDS", 60) or 60)
+        max_attempts = int(getattr(settings, "OPS_MAX_ATTEMPTS", 10) or 10)
+
+        lock_until = (now_dt + timedelta(seconds=lock_seconds)).isoformat()
 
         q = {
             "status": "pending",
             "nextAttemptAt": {"$lte": now},
-            "attempts": {"$lt": int(settings.OPS_MAX_ATTEMPTS)},
+            "attempts": {"$lt": max_attempts},
             "$or": [{"lockUntil": None}, {"lockUntil": {"$lte": now}}],
         }
 
@@ -165,7 +284,7 @@ class MongoStore:
         return doc
 
     async def mark_outbox_sent(self, outbox_id, resp: Optional[Dict[str, Any]] = None) -> None:
-        if not self.enabled:
+        if not self.enabled or self.ops_outbox is None:
             return
         now = utcnow().isoformat()
         await self.ops_outbox.update_one(
@@ -174,19 +293,20 @@ class MongoStore:
         )
 
     async def mark_outbox_failed(self, outbox_id, error: str, attempts: int) -> None:
-        if not self.enabled:
+        if not self.enabled or self.ops_outbox is None:
             return
 
-        # backoff: base * 2^(attempts-1), capped
-        base = int(settings.OPS_BACKOFF_BASE_SECONDS)
-        cap = int(settings.OPS_BACKOFF_MAX_SECONDS)
+        base = int(getattr(settings, "OPS_BACKOFF_BASE_SECONDS", 10) or 10)
+        cap = int(getattr(settings, "OPS_BACKOFF_MAX_SECONDS", 600) or 600)
+        max_attempts = int(getattr(settings, "OPS_MAX_ATTEMPTS", 10) or 10)
+
         delay = min(cap, base * (2 ** max(0, attempts - 1)))
 
         now_dt = utcnow()
         now = now_dt.isoformat()
         next_at = (now_dt + timedelta(seconds=delay)).isoformat()
 
-        if attempts >= int(settings.OPS_MAX_ATTEMPTS):
+        if attempts >= max_attempts:
             await self.ops_outbox.update_one(
                 {"_id": outbox_id},
                 {"$set": {"status": "failed", "failedAt": now, "updatedAt": now, "lockUntil": None, "lastError": error}},
@@ -196,13 +316,7 @@ class MongoStore:
         await self.ops_outbox.update_one(
             {"_id": outbox_id},
             {
-                "$set": {
-                    "status": "pending",
-                    "updatedAt": now,
-                    "lockUntil": None,
-                    "lastError": error,
-                    "nextAttemptAt": next_at,
-                },
+                "$set": {"status": "pending", "updatedAt": now, "lockUntil": None, "lastError": error, "nextAttemptAt": next_at},
                 "$inc": {"attempts": 1},
             },
         )
