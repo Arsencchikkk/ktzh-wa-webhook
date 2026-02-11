@@ -61,7 +61,7 @@ class Settings:
     TEST_CHAT_ID: str = env_str("TEST_CHAT_ID", "")
     TEST_CHANNEL_ID: str = env_str("TEST_CHANNEL_ID", "")
     
-    OPS_CHANNEL_ID: str = "62b3674acaf386ff3d70f86ae496c30a2c2dd732362cd40ea991ee0ef4f3d7d9"   # например id WhatsApp канала исполнителя/группы
+    OPS_CHANNEL_ID: str = "3a9ceaa6-9ac7-4cd2-bfd3-d54356b87384"   # например id WhatsApp канала исполнителя/группы
     OPS_CHAT_ID: str = "77018090200"      # например chatId группы/исполнителя
     OPS_CHAT_TYPE: str = "whatsapp"
     OPS_SEND_URL="https://ktzh-wa-webhook.onrender.com/api/v1/ops/send"
