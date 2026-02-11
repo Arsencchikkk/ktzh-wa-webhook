@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, Optional, List
 import hashlib
 import logging
+import re
 
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
@@ -23,6 +24,9 @@ store = MongoStore()
 dialog = DialogManager(store)
 wazzup = WazzupClient(settings.WAZZUP_API_KEY)
 
+# KTZH-20260211-94ED52-2761DB
+CASE_ID_RE = re.compile(r"\bKTZH-\d{8}-[0-9A-F]{6}-[0-9A-F]{6}\b", re.I)
+
 
 @app.on_event("startup")
 async def startup():
@@ -36,7 +40,8 @@ async def startup():
 @app.on_event("shutdown")
 async def shutdown():
     await store.close()
-    await wazzup.close()
+    if hasattr(wazzup, "close"):
+        await wazzup.close()
 
 
 def chat_hash(chat_id: str) -> str:
@@ -72,9 +77,11 @@ def _payload_to_items(payload: Any) -> List[Dict[str, Any]]:
 
 
 def extract_inbound(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    # wrappers сюда не должны попадать
     if "statuses" in payload or "messages" in payload:
         return None
 
+    # echo нашего бота — игнор
     if payload.get("isEcho") is True:
         return None
 
@@ -106,7 +113,86 @@ def extract_inbound(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 
+def _is_ops_chat(msg: Dict[str, Any]) -> bool:
+    ops_channel = (settings.OPS_CHANNEL_ID or "").strip()
+    ops_chat = (settings.OPS_CHAT_ID or "").strip()
+    if not ops_channel or not ops_chat:
+        return False
+    return (msg.get("channelId") == ops_channel) and (msg.get("chatId") == ops_chat)
+
+
+def _extract_case_id(text: str) -> Optional[str]:
+    m = CASE_ID_RE.search(text or "")
+    return m.group(0).upper() if m else None
+
+
+def _looks_resolved(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+
+    # ключевые слова “закрытия”
+    keywords = (
+        "закрыт", "закрыли", "закрыта", "закрыто",
+        "обработан", "обработано", "обработали",
+        "решено", "решили", "выполнено", "готово",
+        "вернули", "возвратили", "передали владельцу", "владельцу",
+        "нашли", "найдено",
+        "resolved", "closed", "done", "completed",
+    )
+    return any(k in t for k in keywords)
+
+
+async def _handle_ops_incoming(msg: Dict[str, Any]) -> None:
+    """
+    OPS пишет в WhatsApp чат -> сохраняем в messages как ops_in.
+    Если текст содержит caseId и выглядит как “решено/закрыто” -> закрываем кейс в cases.
+    """
+    text = msg.get("text") or ""
+    case_id = _extract_case_id(text)
+
+    log.info("OPS IN: text=%r caseId=%s", text, case_id)
+
+    # 1) логируем входящее от OPS
+    if hasattr(store, "add_message"):
+        try:
+            await store.add_message({
+                "dir": "ops_in",
+                "chatIdHash": "",
+                "chatId": msg.get("chatId"),
+                "channelId": msg.get("channelId"),
+                "chatType": msg.get("chatType"),
+                "text": text,
+                "raw": msg.get("raw"),
+                "meta": {"caseId": case_id} if case_id else {},
+            })
+        except Exception:
+            log.warning("Mongo add_message failed for ops_in", exc_info=True)
+
+    # 2) если есть caseId и текст похож на “решено” -> закрываем кейс
+    if case_id and _looks_resolved(text) and hasattr(store, "close_case"):
+        try:
+            closed = await store.close_case(
+                case_id=case_id,
+                resolution_text=text,
+                meta={
+                    "channelId": msg.get("channelId"),
+                    "chatId": msg.get("chatId"),
+                    "chatType": msg.get("chatType"),
+                },
+            )
+            if closed:
+                log.info("CASE CLOSED ✅ caseId=%s", case_id)
+            else:
+                log.warning("CASE NOT FOUND or already closed: %s", case_id)
+        except Exception:
+            log.warning("close_case failed", exc_info=True)
+
+
 async def _send_to_ops_if_needed(reply: BotReply) -> None:
+    """
+    Если dialog вернул meta.ops -> отправляем текст в OPS чат.
+    """
     ops = (reply.meta or {}).get("ops")
     if not isinstance(ops, dict):
         return
@@ -131,7 +217,7 @@ async def _send_to_ops_if_needed(reply: BotReply) -> None:
     )
     log.info("OPS SENT: %s", res)
 
-    # (опционально) лог в mongo
+    # лог в mongo
     if hasattr(store, "add_message"):
         try:
             await store.add_message({
@@ -158,16 +244,24 @@ async def process_items(items: List[Dict[str, Any]]) -> None:
             log.info("SKIP: not inbound text payload keys=%s", list(item.keys())[:20])
             continue
 
-        # TEST MODE
+        # ✅ 0) если это OPS чат — НЕ гоним через dialog, а обрабатываем закрытие и выходим
+        if _is_ops_chat(msg):
+            await _handle_ops_incoming(msg)
+            continue
+
+        # ✅ 1) TEST MODE только для клиентов (OPS не трогаем)
         if settings.TEST_MODE:
             allowed_chat = (settings.TEST_CHAT_ID or "").strip()
             allowed_channel = (settings.TEST_CHANNEL_ID or "").strip()
+
             if not allowed_chat:
                 log.warning("TEST_MODE enabled but TEST_CHAT_ID empty")
                 continue
+
             if msg["chatId"] != allowed_chat:
                 log.info("TEST_MODE: SKIP chatId=%s", msg["chatId"])
                 continue
+
             if allowed_channel and msg["channelId"] != allowed_channel:
                 log.info("TEST_MODE: SKIP channelId=%s", msg["channelId"])
                 continue
@@ -226,7 +320,7 @@ async def process_items(items: List[Dict[str, Any]]) -> None:
                     "send": send_res,
                 })
 
-        # ✅ отправка оперативникам СРАЗУ
+        # ✅ отправка оперативникам (если dialog вернул meta.ops)
         try:
             await _send_to_ops_if_needed(bot_reply)
         except Exception:
