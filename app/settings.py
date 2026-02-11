@@ -61,8 +61,8 @@ class Settings:
     TEST_CHAT_ID: str = env_str("TEST_CHAT_ID", "")
     TEST_CHANNEL_ID: str = env_str("TEST_CHANNEL_ID", "")
     
-    OPS_CHANNEL_ID: str = ""   # например id WhatsApp канала исполнителя/группы
-    OPS_CHAT_ID: str = ""      # например chatId группы/исполнителя
+    OPS_CHANNEL_ID: str = "2bee1b2b09a8ece59c3a37154ec5e48e51d28b765e2dcc2f47e5c82bf80530dc"   # например id WhatsApp канала исполнителя/группы
+    OPS_CHAT_ID: str = "77779899007"      # например chatId группы/исполнителя
     OPS_CHAT_TYPE: str = "whatsapp"
     
     OPS_WORKER_POLL_SECONDS: int = 2
