@@ -64,9 +64,11 @@ class Settings:
     OPS_CHANNEL_ID: str = "94ed52d3517663fdbccad907281bf7107ee36ea387d74d97b857d82f920feeec"   # например id WhatsApp канала исполнителя/группы
     OPS_CHAT_ID: str = "77052817121"      # например chatId группы/исполнителя
     OPS_CHAT_TYPE: str = "whatsapp"
-    OPS_SEND_URL="https://ktzh-wa-webhook.onrender.com"
+    OPS_SEND_URL="https://ktzh-wa-webhook.onrender.com/api/v1/ops/send"
     OPS_SEND_TOKEN="Aitu2026"
-    
+    OPS_MAX_ATTEMPTS=10
+    OPS_BACKOFF_MAX_SECONDS=600
+    OPS_BACKOFF_BASE_SECONDS=10
     OPS_WORKER_POLL_SECONDS: int = 2
     OPS_WORKER_LOCK_SECONDS: int = 60
     OPS_WORKER_MAX_RETRIES: int = 6
