@@ -11,6 +11,10 @@ from .settings import settings
 from .db import MongoStore
 from .dialog import DialogManager
 from .wazzup_client import WazzupClient
+from .ops_api import router as ops_router
+
+app = FastAPI()
+app.include_router(ops_router)
 
 log = logging.getLogger("ktzh")
 logging.basicConfig(level=logging.INFO)
