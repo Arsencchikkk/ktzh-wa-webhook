@@ -1,4 +1,5 @@
-# dialog.py (FULL) — исправленный: enqueue в ops_outbox через store.enqueue_ops_outbox(...)
+# dialog.py — FULL (без outbox/cron). OPS-текст отдаём через BotReply.meta["ops"].
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -9,8 +10,6 @@ import secrets
 import logging
 
 from .nlu import build_nlu, extract_train_and_car, detect_aggression_and_flood, normalize
-from .settings import settings  # ✅ OPS_*
-
 
 log = logging.getLogger("ktzh")
 
@@ -329,7 +328,7 @@ class DialogManager:
                 "pending": None,
                 "moderation": {"prev_text": None, "repeat_count": 0, "last_ts": 0.0},
                 "loop": {"key": None, "count": 0},
-                "mode": "normal",  # ✅ normal | new_case
+                "mode": "normal",  # normal | new_case
                 "createdAt": _now_utc().isoformat(),
                 "updatedAt": _now_utc().isoformat(),
             }
@@ -388,8 +387,8 @@ class DialogManager:
                 "item": None,
                 "when": None,
                 "complaintText": None,
-                "complaintTopic": None,   # "delay" | "service"
-                "complaintWhen": None,    # дата/время (для delay)
+                "complaintTopic": None,   # delay | service
+                "complaintWhen": None,    # for delay
                 "gratitudeText": None,
                 "staffName": None,
             },
@@ -471,17 +470,16 @@ class DialogManager:
 
         return False
 
-    async def _submit_case(self, chat_id_hash: str, chat_meta: Dict[str, Any], session: Dict[str, Any], case: Dict[str, Any]) -> str:
+    async def _submit_case(self, chat_id_hash: str, session: Dict[str, Any], case: Dict[str, Any]) -> str:
         """
         ✅ Создаём кейс в cases
-        ✅ Кладём сообщение в ops_outbox (pending), которое воркер/cron отправит в WhatsApp/CRM
+        ❌ НЕ пишем в outbox (без cron/worker)
         """
         case_id = _gen_case_id("KTZH", chat_id_hash)
         case["caseId"] = case_id
         case["status"] = "open"
         case["openedAt"] = _now_utc().isoformat()
 
-        # 1) create_case (основная коллекция cases)
         if hasattr(self.store, "create_case"):
             await self.store.create_case({
                 "caseId": case_id,
@@ -491,37 +489,6 @@ class DialogManager:
                 "status": "open",
                 "payload": {"shared": session.get("shared"), "slots": case.get("slots"), "followups": []},
             })
-
-        # 2) ✅ enqueue в ops_outbox (ВАЖНО: метод должен называться enqueue_ops_outbox как в твоём MongoStore)
-        if hasattr(self.store, "enqueue_ops_outbox"):
-            try:
-                ops_text = _fmt_ops_text(case_id, case["type"], session, chat_meta, case)
-
-                target_channel = str(getattr(settings, "OPS_CHANNEL_ID", "") or "").strip()
-                target_chat = str(getattr(settings, "OPS_CHAT_ID", "") or "").strip()
-                target_type = str(getattr(settings, "OPS_CHAT_TYPE", "whatsapp") or "whatsapp").strip()
-
-                if not target_channel or not target_chat:
-                    log.warning("OPS target not configured (OPS_CHANNEL_ID/OPS_CHAT_ID empty). Outbox will be enqueued, but sender may fail.")
-
-                await self.store.enqueue_ops_outbox(
-                    kind="new_case",
-                    case_id=case_id,
-                    case_type=str(case["type"] or ""),
-                    text=ops_text,
-                    source={
-                        "channelId": str(chat_meta.get("channelId") or ""),
-                        "chatId": str(chat_meta.get("chatId") or ""),
-                        "chatType": str(chat_meta.get("chatType") or ""),
-                    },
-                    target={
-                        "channelId": target_channel,
-                        "chatId": target_chat,
-                        "chatType": target_type,
-                    },
-                )
-            except Exception as e:
-                log.warning("enqueue_ops_outbox failed for caseId=%s: %s", case_id, e)
 
         self._loop_reset(session)
         return case_id
@@ -689,14 +656,14 @@ class DialogManager:
 
         open_case_id = await self._get_last_open_case_id(chat_id_hash, session)
 
-        # ✅ новая заявка: полный reset + режим new_case
+        # новая заявка
         if _is_new_case_command(text):
             self._reset_dialog(session)
             session["mode"] = "new_case"
             await self._save_session(chat_id_hash, session)
             return BotReply(text="Ок. Начнём заново. Опишите одним сообщением, что случилось (опоздание / забытая вещь / жалоба / благодарность).")
 
-        # ✅ стоп/отмена
+        # стоп/отмена
         if tnorm in {"стоп", "хватит", "отмена", "прекрати", "прекратите"}:
             self._close_all_cases(session, reason="user_cancel")
             self._reset_dialog(session)
@@ -714,7 +681,7 @@ class DialogManager:
             await self._save_session(chat_id_hash, session)
             return BotReply(text="Ок, остановил. Начнём заново — напишите, что случилось.")
 
-        # ✅ greeting при open заявке ТОЛЬКО если НЕ new_case режим
+        # greeting при open заявке только если не new_case
         if getattr(nlu_res, "greeting_only", False) and open_case_id and session.get("mode") != "new_case":
             await self._save_session(chat_id_hash, session)
             return BotReply(
@@ -725,11 +692,11 @@ class DialogManager:
                 )
             )
 
-        # ✅ если pending — применяем ответы
+        # pending
         if session.get("pending"):
             self._apply_pending(session, text)
 
-        # ✅ FOLLOW-UP к open заявке ТОЛЬКО если НЕ new_case режим и нет процесса сбора
+        # follow-up к open заявке (если не new_case и нет сбора)
         if (
             open_case_id
             and session.get("mode") != "new_case"
@@ -755,14 +722,14 @@ class DialogManager:
                 return BotReply(text=f"Добавил(а) дополнение к заявке {open_case_id}. Спасибо!")
             return BotReply(text=f"Принял(а) дополнение по заявке {open_case_id}. Спасибо!")
 
-        # ✅ обычное приветствие
+        # обычное приветствие
         if getattr(nlu_res, "greeting_only", False) and (not session.get("cases")):
             await self._save_session(chat_id_hash, session)
             return BotReply(text="Здравствуйте! Опишите проблему одним сообщением (опоздание / забытая вещь / жалоба / благодарность).")
 
         intents: List[str] = list(getattr(nlu_res, "intents", []) or [])
 
-        # ✅ если пользователь в режиме new_case и начал реальную заявку — выключаем режим
+        # если был new_case и пошли intents — выключаем режим
         if session.get("mode") == "new_case" and intents:
             session["mode"] = "normal"
 
@@ -790,7 +757,7 @@ class DialogManager:
         for it in intents:
             self._get_or_create_case(session, it)
 
-        # ===== complaint fill + topic + when =====
+        # complaint fill + topic + when
         if "complaint" in intents:
             ccase = self._get_or_create_case(session, "complaint")
 
@@ -807,7 +774,7 @@ class DialogManager:
                 if wh:
                     ccase["slots"]["complaintWhen"] = wh
 
-        # ===== gratitude fill =====
+        # gratitude fill
         if "gratitude" in intents:
             gcase = self._get_or_create_case(session, "gratitude")
             if not gcase["slots"].get("gratitudeText"):
@@ -816,7 +783,7 @@ class DialogManager:
             if slots.get("staffName") and not gcase["slots"].get("staffName"):
                 gcase["slots"]["staffName"] = str(slots["staffName"])
 
-        # ===== lost fill =====
+        # lost fill
         if "lost" in intents:
             lcase = self._get_or_create_case(session, "lost")
 
@@ -840,14 +807,14 @@ class DialogManager:
                 if not lcase["slots"].get("when"):
                     lcase["slots"]["when"] = _extract_when(text)
 
-        # primary
+        # primary case
         primary: Optional[str] = None
         for ct in ["lost", "complaint", "gratitude"]:
             if any(c["type"] == ct and c["status"] in ("open", "collecting") for c in session["cases"]):
                 primary = ct
                 break
 
-        # ===== ask train/car (но для delay не спрашиваем car) =====
+        # ask train/car (для delay не спрашиваем car)
         if primary:
             missing_train = not bool(shared.get("train"))
             missing_car = not bool(shared.get("car"))
@@ -878,17 +845,26 @@ class DialogManager:
 
             self._loop_reset(session)
 
-        # ===== collect missing + submit =====
+        # collect missing + submit
         for ct in ["lost", "complaint", "gratitude"]:
             for case in session["cases"]:
                 if case["type"] != ct or case["status"] not in ("open", "collecting"):
                     continue
 
+                # ✅ submit when ready (case status is collecting)
                 if self._is_case_ready(session, case) and case["status"] != "open":
-                    case_id = await self._submit_case(chat_id_hash, chat_meta, session, case)
+                    case_id = await self._submit_case(chat_id_hash, session, case)
+
+                    # ✅ текст для оперативников -> meta
+                    ops_text = _fmt_ops_text(case_id, ct, session, chat_meta, case)
+
                     session["mode"] = "normal"
                     await self._save_session(chat_id_hash, session)
-                    return BotReply(text=f"Принял(а) ваше обращение: «{_case_title(ct)}». Номер заявки: {case_id}.")
+
+                    return BotReply(
+                        text=f"Принял(а) ваше обращение: «{_case_title(ct)}». Номер заявки: {case_id}.",
+                        meta={"ops": {"caseId": case_id, "caseType": ct, "text": ops_text}},
+                    )
 
                 cs = case["slots"]
 
