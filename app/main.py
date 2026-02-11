@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+from typing import Any, Dict, Optional, List
 import hashlib
 import logging
-from typing import Any, Dict, Optional, List
 
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
@@ -52,12 +52,11 @@ def _check_token(request: Request) -> None:
 
 
 def _payload_to_items(payload: Any) -> List[Dict[str, Any]]:
-    items: List[Dict[str, Any]] = []
-
     if isinstance(payload, list):
+        out: List[Dict[str, Any]] = []
         for x in payload:
-            items.extend(_payload_to_items(x))
-        return items
+            out.extend(_payload_to_items(x))
+        return out
 
     if not isinstance(payload, dict):
         return []
@@ -65,7 +64,7 @@ def _payload_to_items(payload: Any) -> List[Dict[str, Any]]:
     if isinstance(payload.get("messages"), list):
         return [m for m in payload["messages"] if isinstance(m, dict)]
 
-    # statuses — игнорим
+    # statuses — игнор
     if "statuses" in payload or isinstance(payload.get("statuses"), list):
         return []
 
@@ -107,9 +106,8 @@ def extract_inbound(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 
-async def _send_to_ops_if_needed(bot_reply: BotReply) -> None:
-    meta = bot_reply.meta or {}
-    ops = meta.get("ops")
+async def _send_to_ops_if_needed(reply: BotReply) -> None:
+    ops = (reply.meta or {}).get("ops")
     if not isinstance(ops, dict):
         return
 
@@ -117,13 +115,12 @@ async def _send_to_ops_if_needed(bot_reply: BotReply) -> None:
     if not text:
         return
 
-    # target из settings
     ops_channel = (settings.OPS_CHANNEL_ID or "").strip()
     ops_chat = (settings.OPS_CHAT_ID or "").strip()
     ops_type = (settings.OPS_CHAT_TYPE or "whatsapp").strip()
 
     if not ops_channel or not ops_chat:
-        log.warning("OPS target not set: OPS_CHANNEL_ID/OPS_CHAT_ID empty -> cannot send to operators")
+        log.warning("OPS target not configured: OPS_CHANNEL_ID/OPS_CHAT_ID empty")
         return
 
     res = await wazzup.send_message(
@@ -156,6 +153,7 @@ async def process_items(items: List[Dict[str, Any]]) -> None:
 
     for item in items:
         msg = extract_inbound(item)
+
         if not msg or not msg["chatId"]:
             log.info("SKIP: not inbound text payload keys=%s", list(item.keys())[:20])
             continue
@@ -164,23 +162,20 @@ async def process_items(items: List[Dict[str, Any]]) -> None:
         if settings.TEST_MODE:
             allowed_chat = (settings.TEST_CHAT_ID or "").strip()
             allowed_channel = (settings.TEST_CHANNEL_ID or "").strip()
-
             if not allowed_chat:
-                log.warning("TEST_MODE enabled but TEST_CHAT_ID is empty -> skipping all")
+                log.warning("TEST_MODE enabled but TEST_CHAT_ID empty")
                 continue
-
             if msg["chatId"] != allowed_chat:
-                log.info("TEST_MODE: SKIP chatId=%s (allowed=%s)", msg["chatId"], allowed_chat)
+                log.info("TEST_MODE: SKIP chatId=%s", msg["chatId"])
                 continue
-
             if allowed_channel and msg["channelId"] != allowed_channel:
-                log.info("TEST_MODE: SKIP channelId=%s (allowed=%s)", msg["channelId"], allowed_channel)
+                log.info("TEST_MODE: SKIP channelId=%s", msg["channelId"])
                 continue
 
         chat_id_hash = chat_hash(msg["chatId"])
         log.info("IN: chatId=%s text=%r", msg["chatId"], msg["text"])
 
-        # save inbound
+        # входящее в mongo
         if hasattr(store, "add_message"):
             await store.add_message({
                 "dir": "in",
@@ -210,7 +205,7 @@ async def process_items(items: List[Dict[str, Any]]) -> None:
 
         log.info("BOT: reply=%r", bot_reply.text)
 
-        # reply to client
+        # отправка клиенту
         if settings.BOT_SEND_ENABLED:
             send_res = await wazzup.send_message(
                 chat_id=msg["chatId"],
@@ -231,7 +226,7 @@ async def process_items(items: List[Dict[str, Any]]) -> None:
                     "send": send_res,
                 })
 
-        # ✅ СРАЗУ отправляем оперативникам (без cron/worker)
+        # ✅ отправка оперативникам СРАЗУ
         try:
             await _send_to_ops_if_needed(bot_reply)
         except Exception:
