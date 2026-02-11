@@ -1,15 +1,15 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, List
 import hashlib
 import logging
+from typing import Any, Dict, Optional, List
 
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 
 from .settings import settings
 from .db import MongoStore
-from .dialog import DialogManager
+from .dialog import DialogManager, BotReply
 from .wazzup_client import WazzupClient
 from .ops_api import router as ops_router
 
@@ -27,12 +27,6 @@ wazzup = WazzupClient(settings.WAZZUP_API_KEY)
 @app.on_event("startup")
 async def startup():
     await store.connect()
-
-    # ✅ чтобы ops_api мог сделать request.app.state.wazzup
-    app.state.store = store
-    app.state.dialog = dialog
-    app.state.wazzup = wazzup
-
     if getattr(store, "enabled", False):
         log.info("Mongo: ENABLED ✅")
     else:
@@ -41,17 +35,8 @@ async def startup():
 
 @app.on_event("shutdown")
 async def shutdown():
-    # закрываем httpx клиент
-    try:
-        await wazzup.close()
-    except Exception:
-        pass
-
-    # закрываем mongo
-    try:
-        await store.close()
-    except Exception:
-        pass
+    await store.close()
+    await wazzup.close()
 
 
 def chat_hash(chat_id: str) -> str:
@@ -67,14 +52,6 @@ def _check_token(request: Request) -> None:
 
 
 def _payload_to_items(payload: Any) -> List[Dict[str, Any]]:
-    """
-    Wazzup может прислать:
-    - {"messages":[...]}
-    - {"statuses":[...]}
-    - single message dict
-    - list of dicts / list of wrappers
-    Возвращаем ТОЛЬКО message dict'ы.
-    """
     items: List[Dict[str, Any]] = []
 
     if isinstance(payload, list):
@@ -88,16 +65,14 @@ def _payload_to_items(payload: Any) -> List[Dict[str, Any]]:
     if isinstance(payload.get("messages"), list):
         return [m for m in payload["messages"] if isinstance(m, dict)]
 
-    if isinstance(payload.get("statuses"), list) or "statuses" in payload:
+    # statuses — игнорим
+    if "statuses" in payload or isinstance(payload.get("statuses"), list):
         return []
 
     return [payload]
 
 
 def extract_inbound(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Принимаем ТОЛЬКО один message dict (НЕ wrapper).
-    """
     if "statuses" in payload or "messages" in payload:
         return None
 
@@ -109,7 +84,6 @@ def extract_inbound(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return None
 
     text = payload.get("text")
-
     if not text:
         raw = payload.get("raw") or {}
         if isinstance(raw, dict):
@@ -133,29 +107,48 @@ def extract_inbound(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 
-async def _safe_add_message(doc: Dict[str, Any]) -> None:
-    """
-    ✅ Не падаем, если Mongo выключен или метода нет.
-    """
-    if not getattr(store, "enabled", False):
+async def _send_to_ops_if_needed(bot_reply: BotReply) -> None:
+    meta = bot_reply.meta or {}
+    ops = meta.get("ops")
+    if not isinstance(ops, dict):
         return
-    if not hasattr(store, "add_message"):
-        log.warning("MongoStore has no add_message() -> skip saving message")
+
+    text = str(ops.get("text") or "").strip()
+    if not text:
         return
-    try:
-        await store.add_message(doc)  # type: ignore[attr-defined]
-    except Exception as e:
-        log.warning("add_message failed: %s", e)
 
+    # target из settings
+    ops_channel = (settings.OPS_CHANNEL_ID or "").strip()
+    ops_chat = (settings.OPS_CHAT_ID or "").strip()
+    ops_type = (settings.OPS_CHAT_TYPE or "whatsapp").strip()
 
-@app.get("/")
-def root():
-    return {"ok": True, "service": settings.APP_NAME}
+    if not ops_channel or not ops_chat:
+        log.warning("OPS target not set: OPS_CHANNEL_ID/OPS_CHAT_ID empty -> cannot send to operators")
+        return
 
+    res = await wazzup.send_message(
+        chat_id=ops_chat,
+        channel_id=ops_channel,
+        chat_type=ops_type,
+        text=text,
+    )
+    log.info("OPS SENT: %s", res)
 
-@app.get("/health")
-def health():
-    return {"ok": True}
+    # (опционально) лог в mongo
+    if hasattr(store, "add_message"):
+        try:
+            await store.add_message({
+                "dir": "ops_out",
+                "chatIdHash": "",
+                "chatId": ops_chat,
+                "channelId": ops_channel,
+                "chatType": ops_type,
+                "text": text,
+                "send": res,
+                "meta": {"caseId": ops.get("caseId"), "caseType": ops.get("caseType")},
+            })
+        except Exception:
+            log.warning("Mongo add_message failed for ops_out", exc_info=True)
 
 
 async def process_items(items: List[Dict[str, Any]]) -> None:
@@ -163,15 +156,14 @@ async def process_items(items: List[Dict[str, Any]]) -> None:
 
     for item in items:
         msg = extract_inbound(item)
-
         if not msg or not msg["chatId"]:
             log.info("SKIP: not inbound text payload keys=%s", list(item.keys())[:20])
             continue
 
-        # ✅ TEST MODE
-        if getattr(settings, "TEST_MODE", False):
-            allowed_chat = (getattr(settings, "TEST_CHAT_ID", "") or "").strip()
-            allowed_channel = (getattr(settings, "TEST_CHANNEL_ID", "") or "").strip()
+        # TEST MODE
+        if settings.TEST_MODE:
+            allowed_chat = (settings.TEST_CHAT_ID or "").strip()
+            allowed_channel = (settings.TEST_CHANNEL_ID or "").strip()
 
             if not allowed_chat:
                 log.warning("TEST_MODE enabled but TEST_CHAT_ID is empty -> skipping all")
@@ -188,16 +180,17 @@ async def process_items(items: List[Dict[str, Any]]) -> None:
         chat_id_hash = chat_hash(msg["chatId"])
         log.info("IN: chatId=%s text=%r", msg["chatId"], msg["text"])
 
-        # ✅ save inbound
-        await _safe_add_message({
-            "dir": "in",
-            "chatIdHash": chat_id_hash,
-            "chatId": msg["chatId"],
-            "channelId": msg["channelId"],
-            "chatType": msg["chatType"],
-            "text": msg["text"],
-            "raw": msg["raw"],
-        })
+        # save inbound
+        if hasattr(store, "add_message"):
+            await store.add_message({
+                "dir": "in",
+                "chatIdHash": chat_id_hash,
+                "chatId": msg["chatId"],
+                "channelId": msg["channelId"],
+                "chatType": msg["chatType"],
+                "text": msg["text"],
+                "raw": msg["raw"],
+            })
 
         try:
             bot_reply = await dialog.handle(
@@ -213,10 +206,11 @@ async def process_items(items: List[Dict[str, Any]]) -> None:
             )
         except Exception as e:
             log.exception("Dialog error: %s", e)
-            bot_reply = type("BR", (), {"text": "Извините, произошла ошибка. Попробуйте ещё раз."})()
+            bot_reply = BotReply(text="Извините, произошла ошибка. Попробуйте ещё раз.")
 
         log.info("BOT: reply=%r", bot_reply.text)
 
+        # reply to client
         if settings.BOT_SEND_ENABLED:
             send_res = await wazzup.send_message(
                 chat_id=msg["chatId"],
@@ -226,16 +220,32 @@ async def process_items(items: List[Dict[str, Any]]) -> None:
             )
             log.info("SENT: %s", send_res)
 
-            # ✅ save outbound
-            await _safe_add_message({
-                "dir": "out",
-                "chatIdHash": chat_id_hash,
-                "chatId": msg["chatId"],
-                "channelId": msg["channelId"],
-                "chatType": msg["chatType"],
-                "text": bot_reply.text,
-                "send": send_res,
-            })
+            if hasattr(store, "add_message"):
+                await store.add_message({
+                    "dir": "out",
+                    "chatIdHash": chat_id_hash,
+                    "chatId": msg["chatId"],
+                    "channelId": msg["channelId"],
+                    "chatType": msg["chatType"],
+                    "text": bot_reply.text,
+                    "send": send_res,
+                })
+
+        # ✅ СРАЗУ отправляем оперативникам (без cron/worker)
+        try:
+            await _send_to_ops_if_needed(bot_reply)
+        except Exception:
+            log.warning("OPS send failed", exc_info=True)
+
+
+@app.get("/")
+def root():
+    return {"ok": True, "service": settings.APP_NAME}
+
+
+@app.get("/health")
+def health():
+    return {"ok": True}
 
 
 @app.post("/webhooks")
@@ -247,11 +257,7 @@ async def webhooks_alias(request: Request, background: BackgroundTasks):
 async def wazzup_webhook(request: Request, background: BackgroundTasks):
     _check_token(request)
 
-    try:
-        payload = await request.json()
-    except Exception:
-        return JSONResponse({"ok": False, "error": "invalid_json"}, status_code=400)
-
+    payload = await request.json()
     items = _payload_to_items(payload)
 
     if not items:
