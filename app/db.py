@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from typing import Any, Dict, Optional, List, Tuple
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import logging
 import secrets
 
 from motor.motor_asyncio import AsyncIOMotorClient
-from pymongo import ASCENDING, DESCENDING
+from pymongo import ASCENDING, DESCENDING, ReturnDocument
 from pymongo.errors import OperationFailure, DuplicateKeyError
 
 from .settings import settings
@@ -29,6 +29,7 @@ class MongoStore:
         self.sessions = None
         self.messages = None
         self.cases = None
+        self.ops_outbox = None
         self.enabled: bool = False
 
     async def _ensure_index(self, coll, keys: List[Tuple[str, int]], **opts) -> None:
@@ -40,7 +41,6 @@ class MongoStore:
         """
         keys_norm = _keys_list(keys)
 
-        # 1) если индекс уже есть с таким key pattern — ничего не делаем
         try:
             async for idx in coll.list_indexes():
                 existing = list(idx.get("key", {}).items())
@@ -52,7 +52,6 @@ class MongoStore:
         except Exception as e:
             log.warning("Mongo list_indexes failed for %s: %s", getattr(coll, "name", "unknown"), e)
 
-        # 2) пробуем создать
         try:
             await coll.create_index(keys, **opts)
         except DuplicateKeyError as e:
@@ -60,8 +59,6 @@ class MongoStore:
             return
         except OperationFailure as e:
             code = getattr(e, "code", None)
-            # 85 = IndexOptionsConflict
-            # 11000 = duplicate key (E11000) при unique индексе на старых дублях
             if code in (85, 11000):
                 log.warning("Mongo index create skipped (code %s) for %s on %s: %s", code, keys_norm, coll.name, e)
                 return
@@ -79,22 +76,21 @@ class MongoStore:
         self.sessions = self.db[settings.COL_SESSIONS]
         self.messages = self.db[settings.COL_MESSAGES]
         self.cases = self.db[settings.COL_CASES]
+        self.ops_outbox = self.db[getattr(settings, "COL_OPS_OUTBOX", "ops_outbox")]
 
         await self.db.command("ping")
 
-        # ✅ индексы (без падения)
+        # ✅ индексы
         await self._ensure_index(self.sessions, [("chatIdHash", ASCENDING)], unique=True)
         await self._ensure_index(self.messages, [("chatIdHash", ASCENDING), ("createdAt", ASCENDING)])
         await self._ensure_index(self.cases, [("chatIdHash", ASCENDING), ("status", ASCENDING), ("type", ASCENDING)])
-
-        # ✅ быстрый поиск последней open-заявки
-        await self._ensure_index(
-            self.cases,
-            [("chatIdHash", ASCENDING), ("status", ASCENDING), ("updatedAt", DESCENDING)],
-        )
-
-        # ✅ уникальный caseId (не падаем при старых дублях)
+        await self._ensure_index(self.cases, [("chatIdHash", ASCENDING), ("status", ASCENDING), ("updatedAt", DESCENDING)])
         await self._ensure_index(self.cases, [("caseId", ASCENDING)], unique=True)
+
+        # ✅ outbox индексы (воркер)
+        await self._ensure_index(self.ops_outbox, [("status", ASCENDING), ("nextAttemptAt", ASCENDING), ("createdAt", DESCENDING)])
+        await self._ensure_index(self.ops_outbox, [("lockUntil", ASCENDING)])
+        await self._ensure_index(self.ops_outbox, [("caseId", ASCENDING), ("kind", ASCENDING)])
 
         self.enabled = True
 
@@ -119,7 +115,6 @@ class MongoStore:
         doc["chatIdHash"] = chat_id_hash
         doc["updatedAt"] = utcnow().isoformat()
 
-        # 🔥 важно: createdAt не должен быть в $set (иначе конфликт с $setOnInsert)
         doc.pop("_id", None)
         doc.pop("createdAt", None)
 
@@ -148,14 +143,12 @@ class MongoStore:
         d = dict(doc)
         d.pop("_id", None)
 
-        # ✅ гарантируем caseId
         if not d.get("caseId"):
             if d.get("ticketId"):
                 d["caseId"] = str(d["ticketId"])
             else:
                 d["caseId"] = f"KTZH-{utcnow().strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(3).upper()}"
 
-        # ✅ гарантируем payload.followups
         payload = d.get("payload") or {}
         if not isinstance(payload, dict):
             payload = {}
@@ -165,25 +158,22 @@ class MongoStore:
         now = utcnow().isoformat()
         created = d.get("createdAt") or now
 
-        # 🔥 убираем таймстампы из вставочного дока,
-        # чтобы updatedAt не конфликтовал между $setOnInsert и $set
         d.pop("createdAt", None)
         d.pop("updatedAt", None)
 
         insert_doc = dict(d)
-        insert_doc["createdAt"] = created  # только onInsert
+        insert_doc["createdAt"] = created
 
         try:
             await self.cases.update_one(
                 {"caseId": d["caseId"]},
                 {
                     "$setOnInsert": insert_doc,
-                    "$set": {"updatedAt": now},  # updatedAt только здесь (и при insert тоже сработает)
+                    "$set": {"updatedAt": now},
                 },
                 upsert=True,
             )
         except DuplicateKeyError as e:
-            # на случай гонок или кривых старых данных
             log.warning("create_case: duplicate key for caseId=%s: %s", d.get("caseId"), e)
 
     async def get_last_open_case(self, chat_id_hash: str) -> Optional[Dict[str, Any]]:
@@ -196,10 +186,6 @@ class MongoStore:
         )
 
     async def append_case_followup(self, case_id: str, note: Dict[str, Any]) -> bool:
-        """
-        Добавляет дополнение в payload.followups[] и обновляет updatedAt.
-        Пишем ТОЛЬКО в open кейс.
-        """
         if not self.enabled:
             return False
 
@@ -209,14 +195,84 @@ class MongoStore:
 
         res = await self.cases.update_one(
             {"caseId": case_id, "status": "open"},
-            {
-                "$push": {"payload.followups": n},
-                "$set": {"updatedAt": utcnow().isoformat()},
-            },
+            {"$push": {"payload.followups": n}, "$set": {"updatedAt": utcnow().isoformat()}},
         )
 
         if res.matched_count == 0:
             log.warning("append_case_followup: open case not found: %s", case_id)
             return False
-
         return True
+
+    # ===================== OPS OUTBOX =====================
+
+    async def enqueue_ops_message(self, payload: Dict[str, Any]) -> None:
+        """Кладём сообщение в ops_outbox со статусом pending."""
+        if not self.enabled or self.ops_outbox is None:
+            return
+
+        now = utcnow().isoformat()
+        d = dict(payload)
+        d.pop("_id", None)
+        d.setdefault("status", "pending")          # pending|processing|sent|failed
+        d.setdefault("attempts", 0)
+        d.setdefault("createdAt", now)
+        d.setdefault("updatedAt", now)
+        d.setdefault("nextAttemptAt", now)        # можно отложить
+        d.setdefault("lockUntil", None)
+
+        await self.ops_outbox.insert_one(d)
+
+    async def claim_next_ops_message(self, lock_seconds: int = 60) -> Optional[Dict[str, Any]]:
+        """
+        Атомарно "забираем" 1 pending сообщение, ставим processing + lockUntil.
+        Чтобы несколько воркеров не отправляли одно и то же.
+        """
+        if not self.enabled or self.ops_outbox is None:
+            return None
+
+        now_dt = utcnow()
+        now = now_dt.isoformat()
+        lock_until = (now_dt + timedelta(seconds=lock_seconds)).isoformat()
+
+        doc = await self.ops_outbox.find_one_and_update(
+            filter={
+                "status": "pending",
+                "nextAttemptAt": {"$lte": now},
+                "$or": [{"lockUntil": None}, {"lockUntil": {"$lte": now}}],
+            },
+            update={
+                "$set": {"status": "processing", "lockUntil": lock_until, "updatedAt": now},
+                "$inc": {"attempts": 1},
+            },
+            sort=[("nextAttemptAt", ASCENDING), ("createdAt", ASCENDING)],
+            return_document=ReturnDocument.AFTER,
+        )
+        return doc
+
+    async def mark_ops_sent(self, outbox_id, response: Dict[str, Any]) -> None:
+        if not self.enabled or self.ops_outbox is None:
+            return
+        now = utcnow().isoformat()
+        await self.ops_outbox.update_one(
+            {"_id": outbox_id},
+            {"$set": {"status": "sent", "sentAt": now, "updatedAt": now, "lockUntil": None, "response": response}},
+        )
+
+    async def mark_ops_failed(self, outbox_id, error: str, retry_after_seconds: int, give_up: bool = False) -> None:
+        if not self.enabled or self.ops_outbox is None:
+            return
+        now_dt = utcnow()
+        now = now_dt.isoformat()
+        next_at = (now_dt + timedelta(seconds=retry_after_seconds)).isoformat()
+
+        if give_up:
+            await self.ops_outbox.update_one(
+                {"_id": outbox_id},
+                {"$set": {"status": "failed", "updatedAt": now, "lockUntil": None, "error": error}},
+            )
+            return
+
+        await self.ops_outbox.update_one(
+            {"_id": outbox_id},
+            {"$set": {"status": "pending", "updatedAt": now, "lockUntil": None, "error": error, "nextAttemptAt": next_at}},
+        )
