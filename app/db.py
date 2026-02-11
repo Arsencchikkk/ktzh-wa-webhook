@@ -187,6 +187,60 @@ class MongoStore:
         except DuplicateKeyError as e:
             log.warning("create_case: duplicate key for caseId=%s: %s", d.get("caseId"), e)
 
+    async def get_case(self, case_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Получить кейс по caseId.
+        """
+        if not self.enabled:
+            return None
+        if not case_id:
+            return None
+        return await self.cases.find_one({"caseId": case_id})
+
+    async def close_case(
+        self,
+        case_id: str,
+        resolution_text: str,
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Закрыть кейс по caseId:
+        - status=closed
+        - closedAt/updatedAt
+        - closeReason=ops_resolved
+        - resolutionText
+        - + followup note в payload.followups
+        Возвращает обновлённый документ кейса (или None если не найден).
+        """
+        if not self.enabled:
+            return None
+        if not case_id:
+            return None
+
+        now = utcnow().isoformat()
+        note = {
+            "ts": now,
+            "text": (resolution_text or "").strip(),
+            "meta": {"by": "ops", **(meta or {})},
+        }
+
+        # закрываем даже если был collecting/open, но не трогаем уже closed
+        doc = await self.cases.find_one_and_update(
+            {"caseId": case_id, "status": {"$ne": "closed"}},
+            {
+                "$set": {
+                    "status": "closed",
+                    "closedAt": now,
+                    "updatedAt": now,
+                    "closeReason": "ops_resolved",
+                    "resolutionText": (resolution_text or "").strip(),
+                },
+                "$push": {"payload.followups": note},
+            },
+            return_document=ReturnDocument.AFTER,
+        )
+        return doc
+
     async def get_last_open_case(self, chat_id_hash: str) -> Optional[Dict[str, Any]]:
         if not self.enabled:
             return None
@@ -261,7 +315,12 @@ class MongoStore:
         now_dt = utcnow()
         now = now_dt.isoformat()
 
-        lock_seconds = int(getattr(settings, "OPS_LOCK_SECONDS", 60) or 60)
+        # ✅ фикс: поддерживаем оба названия env (чтобы не было "0" или None)
+        lock_seconds = int(
+            getattr(settings, "OPS_LOCK_SECONDS", None)
+            or getattr(settings, "OPS_WORKER_LOCK_SECONDS", None)
+            or 60
+        )
         max_attempts = int(getattr(settings, "OPS_MAX_ATTEMPTS", 10) or 10)
 
         lock_until = (now_dt + timedelta(seconds=lock_seconds)).isoformat()
