@@ -3,158 +3,113 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 import httpx
 
 from .db import MongoStore
 from .settings import settings
 
-log = logging.getLogger("ktzh.ops_worker")
+log = logging.getLogger("ktzh")
 
 
-def _s(val: Any) -> str:
-    return "" if val is None else str(val)
+def _fill_target_from_env(item: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Если target пустой — подставим дефолт из env.
+    """
+    tgt = dict(item.get("target") or {})
+    tgt.setdefault("chatType", settings.OPS_CHAT_TYPE or "whatsapp")
+
+    if not tgt.get("channelId"):
+        tgt["channelId"] = settings.OPS_CHANNEL_ID or ""
+    if not tgt.get("chatId"):
+        tgt["chatId"] = settings.OPS_CHAT_ID or ""
+
+    return tgt
 
 
-def _get_cfg(name: str, default: Any = None) -> Any:
-    # берем из settings если есть, иначе из env
-    if hasattr(settings, name):
-        v = getattr(settings, name)
-        if v is not None and v != "":
-            return v
-    env = os.getenv(name)
-    return env if env not in (None, "") else default
+async def _send_http(payload: Dict[str, Any]) -> Dict[str, Any]:
+    url = (settings.OPS_SEND_URL or "").strip()
+    if not url:
+        raise RuntimeError("OPS_SEND_URL is empty")
 
+    headers = {}
+    token = (settings.OPS_SEND_TOKEN or "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
 
-async def wazzup_send_message(
-    client: httpx.AsyncClient,
-    *,
-    channel_id: str,
-    chat_id: str,
-    chat_type: str,
-    text: str,
-) -> Dict[str, Any]:
-    base = _s(_get_cfg("WAZZUP_API_BASE", "https://api.wazzup24.com")).rstrip("/")
-    token = _s(_get_cfg("WAZZUP_API_TOKEN", ""))
-
-    if not token:
-        raise RuntimeError("WAZZUP_API_TOKEN is empty")
-    if not channel_id or not chat_id:
-        raise RuntimeError("target channelId/chatId is empty")
-
-    url = f"{base}/v3/message"
-    headers = {"Authorization": f"Bearer {token}"}
-
-    payload = {
-        "channelId": channel_id,
-        "chatType": chat_type,
-        "chatId": chat_id,
-        "text": text,
-    }
-
-    r = await client.post(url, headers=headers, json=payload, timeout=20.0)
-    data: Dict[str, Any]
-    try:
-        data = r.json()
-    except Exception:
-        data = {"raw": r.text}
-
-    if r.status_code not in (200, 201):
-        raise RuntimeError(f"Wazzup HTTP {r.status_code}: {data}")
-
-    return {"status_code": r.status_code, "data": data}
-
-
-def _backoff_seconds(attempt: int) -> int:
-    # 1,2,4,8,16,32... (max 10 min)
-    sec = 2 ** max(0, attempt - 1)
-    return min(sec, 600)
-
-
-async def process_one(store: MongoStore, http: httpx.AsyncClient) -> bool:
-    lock_seconds = int(_get_cfg("OPS_WORKER_LOCK_SECONDS", 60))
-    max_retries = int(_get_cfg("OPS_WORKER_MAX_RETRIES", 6))
-
-    doc = await store.claim_next_ops_message(lock_seconds=lock_seconds)
-    if not doc:
-        return False
-
-    outbox_id = doc.get("_id")
-    attempts = int(doc.get("attempts") or 0)
-
-    try:
-        target = doc.get("target") or {}
-        channel_id = _s(target.get("channelId"))
-        chat_id = _s(target.get("chatId"))
-        chat_type = _s(target.get("chatType") or "whatsapp")
-        text = _s(doc.get("text"))
-
-        # защита от пустого текста
-        if not text.strip():
-            raise RuntimeError("outbox.text is empty")
-
-        resp = await wazzup_send_message(
-            http,
-            channel_id=channel_id,
-            chat_id=chat_id,
-            chat_type=chat_type,
-            text=text,
-        )
-
-        await store.mark_ops_sent(outbox_id, resp)
-        log.info("SENT outbox=%s caseId=%s", outbox_id, doc.get("caseId"))
-        return True
-
-    except Exception as e:
-        err = str(e)
-        give_up = attempts >= max_retries
-        retry_after = _backoff_seconds(attempts)
-
-        await store.mark_ops_failed(outbox_id, err, retry_after_seconds=retry_after, give_up=give_up)
-
-        if give_up:
-            log.error("FAILED permanently outbox=%s caseId=%s err=%s", outbox_id, doc.get("caseId"), err)
-        else:
-            log.warning("FAILED retry outbox=%s caseId=%s in %ss err=%s", outbox_id, doc.get("caseId"), retry_after, err)
-
-        return True  # обработали (даже если ошибка)
+    timeout = httpx.Timeout(15.0, connect=10.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        r = await client.post(url, json=payload, headers=headers)
+        # лог полезен
+        if r.status_code >= 400:
+            raise RuntimeError(f"HTTP {r.status_code}: {r.text[:500]}")
+        try:
+            return r.json()
+        except Exception:
+            return {"status_code": r.status_code, "text": r.text[:500]}
 
 
 async def run_worker(once: bool = False) -> None:
-    poll = int(_get_cfg("OPS_WORKER_POLL_SECONDS", 2))
-
     store = MongoStore()
     await store.connect()
+    if not store.enabled:
+        log.warning("MongoStore disabled (no MONGODB_URI). Worker exits.")
+        return
 
-    async with httpx.AsyncClient() as http:
+    log.info("OPS worker started. once=%s", once)
+
+    try:
         while True:
-            did_any = False
+            item = await store.claim_pending_outbox()
+            if not item:
+                if once:
+                    return
+                await asyncio.sleep(float(settings.OPS_POLL_SECONDS))
+                continue
 
-            # выжимаем очередь до пустоты
-            while True:
-                ok = await process_one(store, http)
-                if not ok:
-                    break
-                did_any = True
+            outbox_id = item["_id"]
+            attempts = int(item.get("attempts", 0))
+
+            target = _fill_target_from_env(item)
+            if not target.get("channelId") or not target.get("chatId"):
+                err = "OPS target not configured (channelId/chatId empty)"
+                log.warning("%s; outbox_id=%s", err, outbox_id)
+                await store.mark_outbox_failed(outbox_id, err, attempts + 1)
+                continue
+
+            payload = {
+                "channelId": target["channelId"],
+                "chatId": target["chatId"],
+                "chatType": target.get("chatType", "whatsapp"),
+                "text": item.get("text", ""),
+                "meta": {
+                    "kind": item.get("kind"),
+                    "caseId": item.get("caseId"),
+                    "caseType": item.get("caseType"),
+                    "source": item.get("source", {}),
+                },
+            }
+
+            try:
+                resp = await _send_http(payload)
+                await store.mark_outbox_sent(outbox_id, resp=resp)
+                log.info("OPS sent outbox_id=%s caseId=%s", outbox_id, item.get("caseId"))
+            except Exception as e:
+                err = str(e)
+                log.warning("OPS send failed outbox_id=%s caseId=%s err=%s", outbox_id, item.get("caseId"), err)
+                await store.mark_outbox_failed(outbox_id, err, attempts + 1)
 
             if once:
-                break
-
-            if not did_any:
-                await asyncio.sleep(poll)
-
-    await store.close()
+                return
+    finally:
+        await store.close()
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO)
-
     parser = argparse.ArgumentParser()
-    parser.add_argument("--once", action="store_true", help="run one pass and exit (for cron)")
+    parser.add_argument("--once", action="store_true", help="Run single send attempt then exit (for cron)")
     args = parser.parse_args()
-
     asyncio.run(run_worker(once=args.once))
 
 
