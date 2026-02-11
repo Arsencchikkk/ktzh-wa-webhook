@@ -1,5 +1,4 @@
-# dialog.py (FULL, исправленный под Variant A: ops_outbox enqueue + worker/cron)
-
+# dialog.py (FULL) — исправленный: enqueue в ops_outbox через store.enqueue_ops_outbox(...)
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -10,7 +9,7 @@ import secrets
 import logging
 
 from .nlu import build_nlu, extract_train_and_car, detect_aggression_and_flood, normalize
-from .settings import settings  # ✅ нужно для OPS_* target
+from .settings import settings  # ✅ OPS_*
 
 
 log = logging.getLogger("ktzh")
@@ -225,7 +224,7 @@ def _is_new_case_command(text: str) -> bool:
         "начать заново",
         "новая",
     )
-    return any(k in tn for g in keys for k in (g,))  # (оставлено поведение как было)
+    return any(k in tn for k in keys)
 
 
 def _is_no_more_details(text: str) -> bool:
@@ -310,7 +309,7 @@ def _fmt_ops_text(case_id: str, case_type: str, session: Dict[str, Any], chat_me
             lines.append(f"Сотрудник: {slots.get('staffName')}")
         lines.append(f"Благодарность: {slots.get('gratitudeText') or '-'}")
 
-    return "\n".join(lines)
+    return "\n".join(lines).strip()
 
 
 class DialogManager:
@@ -482,6 +481,7 @@ class DialogManager:
         case["status"] = "open"
         case["openedAt"] = _now_utc().isoformat()
 
+        # 1) create_case (основная коллекция cases)
         if hasattr(self.store, "create_case"):
             await self.store.create_case({
                 "caseId": case_id,
@@ -492,32 +492,36 @@ class DialogManager:
                 "payload": {"shared": session.get("shared"), "slots": case.get("slots"), "followups": []},
             })
 
-        # ✅ enqueue ops outbox (не ломаем диалог при ошибках)
-        if hasattr(self.store, "enqueue_ops_message"):
+        # 2) ✅ enqueue в ops_outbox (ВАЖНО: метод должен называться enqueue_ops_outbox как в твоём MongoStore)
+        if hasattr(self.store, "enqueue_ops_outbox"):
             try:
                 ops_text = _fmt_ops_text(case_id, case["type"], session, chat_meta, case)
 
-                target_channel = str(getattr(settings, "OPS_CHANNEL_ID", "") or "")
-                target_chat = str(getattr(settings, "OPS_CHAT_ID", "") or "")
-                target_type = str(getattr(settings, "OPS_CHAT_TYPE", "whatsapp") or "whatsapp")
+                target_channel = str(getattr(settings, "OPS_CHANNEL_ID", "") or "").strip()
+                target_chat = str(getattr(settings, "OPS_CHAT_ID", "") or "").strip()
+                target_type = str(getattr(settings, "OPS_CHAT_TYPE", "whatsapp") or "whatsapp").strip()
 
                 if not target_channel or not target_chat:
-                    log.warning("OPS target not configured (OPS_CHANNEL_ID/OPS_CHAT_ID empty). Outbox will likely fail to send.")
+                    log.warning("OPS target not configured (OPS_CHANNEL_ID/OPS_CHAT_ID empty). Outbox will be enqueued, but sender may fail.")
 
-                await self.store.enqueue_ops_message({
-                    "kind": "new_case",
-                    "caseId": case_id,
-                    "caseType": case["type"],
-                    "text": ops_text,
-                    "target": {"channelId": target_channel, "chatId": target_chat, "chatType": target_type},
-                    "source": {
+                await self.store.enqueue_ops_outbox(
+                    kind="new_case",
+                    case_id=case_id,
+                    case_type=str(case["type"] or ""),
+                    text=ops_text,
+                    source={
                         "channelId": str(chat_meta.get("channelId") or ""),
                         "chatId": str(chat_meta.get("chatId") or ""),
                         "chatType": str(chat_meta.get("chatType") or ""),
                     },
-                })
+                    target={
+                        "channelId": target_channel,
+                        "chatId": target_chat,
+                        "chatType": target_type,
+                    },
+                )
             except Exception as e:
-                log.warning("enqueue_ops_message failed for caseId=%s: %s", case_id, e)
+                log.warning("enqueue_ops_outbox failed for caseId=%s: %s", case_id, e)
 
         self._loop_reset(session)
         return case_id
@@ -881,7 +885,6 @@ class DialogManager:
                     continue
 
                 if self._is_case_ready(session, case) and case["status"] != "open":
-                    # ✅ ИЗМЕНЕНО: добавили chat_meta
                     case_id = await self._submit_case(chat_id_hash, chat_meta, session, case)
                     session["mode"] = "normal"
                     await self._save_session(chat_id_hash, session)
