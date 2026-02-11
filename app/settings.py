@@ -37,6 +37,7 @@ class Settings:
     COL_SESSIONS: str = env_str("MONGO_SESSIONS_COLLECTION", "sessions")
     COL_MESSAGES: str = env_str("MONGO_MESSAGES_COLLECTION", "messages")
     COL_CASES: str = env_str("MONGO_CASES_COLLECTION", "cases")
+    COL_OPS_OUTBOX: str = "ops_outbox"
 
     # Wazzup
     WAZZUP_API_URL: str = env_str("WAZZUP_API_URL", "https://api.wazzup24.com/v3")
@@ -59,6 +60,14 @@ class Settings:
     TEST_MODE: bool = env_bool("TEST_MODE", False)
     TEST_CHAT_ID: str = env_str("TEST_CHAT_ID", "")
     TEST_CHANNEL_ID: str = env_str("TEST_CHANNEL_ID", "")
+    
+    OPS_CHANNEL_ID: str = ""   # например id WhatsApp канала исполнителя/группы
+    OPS_CHAT_ID: str = ""      # например chatId группы/исполнителя
+    OPS_CHAT_TYPE: str = "whatsapp"
+    
+    OPS_WORKER_POLL_SECONDS: int = 2
+    OPS_WORKER_LOCK_SECONDS: int = 60
+    OPS_WORKER_MAX_RETRIES: int = 6
 
 
 settings = Settings()
