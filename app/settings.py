@@ -11,7 +11,7 @@ def env_str(key: str, default: str = "") -> str:
 
 def env_int(key: str, default: int = 0) -> int:
     v = os.getenv(key)
-    if v is None or v == "":
+    if not v:
         return default
     try:
         return int(v)
@@ -21,23 +21,22 @@ def env_int(key: str, default: int = 0) -> int:
 
 def env_bool(key: str, default: bool = False) -> bool:
     v = os.getenv(key)
-    if v is None or v == "":
+    if not v:
         return default
-    v = v.strip().lower()
-    return v in ("1", "true", "yes", "y", "on")
+    return v.strip().lower() in ("1", "true", "yes", "y", "on")
 
 
 @dataclass(frozen=True)
 class Settings:
     APP_NAME: str = env_str("APP_NAME", "KTZH Smart Bot")
 
-    # Mongo (берём из MONGODB_URI или MONGO_URI)
+    # Mongo
     MONGODB_URI: str = env_str("MONGODB_URI", env_str("MONGO_URI", ""))
     DB_NAME: str = env_str("MONGO_DB", "ktzh")
     COL_SESSIONS: str = env_str("MONGO_SESSIONS_COLLECTION", "sessions")
     COL_MESSAGES: str = env_str("MONGO_MESSAGES_COLLECTION", "messages")
     COL_CASES: str = env_str("MONGO_CASES_COLLECTION", "cases")
-    COL_OPS_OUTBOX: str = "ops_outbox"
+    COL_OPS_OUTBOX: str = env_str("MONGO_OPS_OUTBOX_COLLECTION", "ops_outbox")  # если вдруг оставишь
 
     # Wazzup
     WAZZUP_API_URL: str = env_str("WAZZUP_API_URL", "https://api.wazzup24.com/v3")
@@ -50,28 +49,18 @@ class Settings:
     BOT_SEND_ENABLED: bool = env_bool("BOT_SEND_ENABLED", True)
     PHONE_HASH_SALT: str = env_str("PHONE_HASH_SALT", "change_me")
 
-    # Dialog tuning
-    MEANING_MIN_SCORE: int = env_int("MEANING_MIN_SCORE", 2)
-    MAX_HISTORY: int = env_int("MAX_HISTORY", 20)
-    FLOOD_WINDOW_SEC: int = env_int("FLOOD_WINDOW_SEC", 8)
-    FLOOD_MAX_MSG: int = env_int("FLOOD_MAX_MSG", 4)
-
-    # ✅ Test mode (принимаем/отвечаем только одному абоненту)
+    # Test mode
     TEST_MODE: bool = env_bool("TEST_MODE", False)
     TEST_CHAT_ID: str = env_str("TEST_CHAT_ID", "")
     TEST_CHANNEL_ID: str = env_str("TEST_CHANNEL_ID", "")
-    
-    OPS_CHANNEL_ID: str = "3a9ceaa6-9ac7-4cd2-bfd3-d54356b87384"   # например id WhatsApp канала исполнителя/группы
-    OPS_CHAT_ID: str = "77078718601"      # например chatId группы/исполнителя
-    OPS_CHAT_TYPE: str = "whatsapp"
-    OPS_SEND_URL="https://ktzh-wa-webhook.onrender.com/api/v1/ops/send"
-    OPS_SEND_TOKEN="Aitu2026"
-    OPS_MAX_ATTEMPTS=10
-    OPS_BACKOFF_MAX_SECONDS=600
-    OPS_BACKOFF_BASE_SECONDS=10
-    OPS_WORKER_POLL_SECONDS: int = 2
-    OPS_WORKER_LOCK_SECONDS: int = 60
-    OPS_WORKER_MAX_RETRIES: int = 6
+
+    # ✅ OPS target (куда слать оперативникам через Wazzup)
+    OPS_CHANNEL_ID: str = env_str("OPS_CHANNEL_ID", "")
+    OPS_CHAT_ID: str = env_str("OPS_CHAT_ID", "")
+    OPS_CHAT_TYPE: str = env_str("OPS_CHAT_TYPE", "whatsapp")
+
+    # ops_api (если хочешь оставлять ручной endpoint /api/v1/ops/send)
+    OPS_SEND_TOKEN: str = env_str("OPS_SEND_TOKEN", "")
 
 
 settings = Settings()
