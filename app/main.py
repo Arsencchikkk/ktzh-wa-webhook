@@ -13,13 +13,13 @@ from .dialog import DialogManager
 from .wazzup_client import WazzupClient
 from .ops_api import router as ops_router
 
-app.include_router(ops_router)
+
 
 log = logging.getLogger("ktzh")
 logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(title=settings.APP_NAME)
-
+app.include_router(ops_router)
 store = MongoStore()
 dialog = DialogManager(store)
 wazzup = WazzupClient(settings.WAZZUP_API_KEY)
