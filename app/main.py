@@ -13,13 +13,12 @@ from .dialog import DialogManager
 from .wazzup_client import WazzupClient
 from .ops_api import router as ops_router
 
-
-
 log = logging.getLogger("ktzh")
 logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(title=settings.APP_NAME)
 app.include_router(ops_router)
+
 store = MongoStore()
 dialog = DialogManager(store)
 wazzup = WazzupClient(settings.WAZZUP_API_KEY)
@@ -28,6 +27,12 @@ wazzup = WazzupClient(settings.WAZZUP_API_KEY)
 @app.on_event("startup")
 async def startup():
     await store.connect()
+
+    # ✅ чтобы ops_api мог сделать request.app.state.wazzup
+    app.state.store = store
+    app.state.dialog = dialog
+    app.state.wazzup = wazzup
+
     if getattr(store, "enabled", False):
         log.info("Mongo: ENABLED ✅")
     else:
@@ -36,9 +41,17 @@ async def startup():
 
 @app.on_event("shutdown")
 async def shutdown():
-    await store.close()
-    if hasattr(wazzup, "close"):
+    # закрываем httpx клиент
+    try:
         await wazzup.close()
+    except Exception:
+        pass
+
+    # закрываем mongo
+    try:
+        await store.close()
+    except Exception:
+        pass
 
 
 def chat_hash(chat_id: str) -> str:
@@ -72,14 +85,12 @@ def _payload_to_items(payload: Any) -> List[Dict[str, Any]]:
     if not isinstance(payload, dict):
         return []
 
-    # wrappers
     if isinstance(payload.get("messages"), list):
         return [m for m in payload["messages"] if isinstance(m, dict)]
 
     if isinstance(payload.get("statuses"), list) or "statuses" in payload:
         return []
 
-    # single message dict
     return [payload]
 
 
@@ -87,23 +98,18 @@ def extract_inbound(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
     Принимаем ТОЛЬКО один message dict (НЕ wrapper).
     """
-    # statuses callbacks / wrapper сюда не должны попадать
     if "statuses" in payload or "messages" in payload:
         return None
 
-    # echo from our bot
     if payload.get("isEcho") is True:
         return None
 
-    # if direction exists and not inbound
     direction = payload.get("direction")
     if direction and direction != "inbound":
         return None
 
-    # ✅ Wazzup часто кладёт text прямо в корень
     text = payload.get("text")
 
-    # fallback legacy formats
     if not text:
         raw = payload.get("raw") or {}
         if isinstance(raw, dict):
@@ -127,6 +133,21 @@ def extract_inbound(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 
+async def _safe_add_message(doc: Dict[str, Any]) -> None:
+    """
+    ✅ Не падаем, если Mongo выключен или метода нет.
+    """
+    if not getattr(store, "enabled", False):
+        return
+    if not hasattr(store, "add_message"):
+        log.warning("MongoStore has no add_message() -> skip saving message")
+        return
+    try:
+        await store.add_message(doc)  # type: ignore[attr-defined]
+    except Exception as e:
+        log.warning("add_message failed: %s", e)
+
+
 @app.get("/")
 def root():
     return {"ok": True, "service": settings.APP_NAME}
@@ -147,7 +168,7 @@ async def process_items(items: List[Dict[str, Any]]) -> None:
             log.info("SKIP: not inbound text payload keys=%s", list(item.keys())[:20])
             continue
 
-        # ✅ TEST MODE: обрабатываем/отвечаем только на один chatId (+ optional channelId)
+        # ✅ TEST MODE
         if getattr(settings, "TEST_MODE", False):
             allowed_chat = (getattr(settings, "TEST_CHAT_ID", "") or "").strip()
             allowed_channel = (getattr(settings, "TEST_CHANNEL_ID", "") or "").strip()
@@ -167,8 +188,8 @@ async def process_items(items: List[Dict[str, Any]]) -> None:
         chat_id_hash = chat_hash(msg["chatId"])
         log.info("IN: chatId=%s text=%r", msg["chatId"], msg["text"])
 
-        # ✅ пишем входящее в Mongo (если включен store)
-        await store.add_message({
+        # ✅ save inbound
+        await _safe_add_message({
             "dir": "in",
             "chatIdHash": chat_id_hash,
             "chatId": msg["chatId"],
@@ -205,8 +226,8 @@ async def process_items(items: List[Dict[str, Any]]) -> None:
             )
             log.info("SENT: %s", send_res)
 
-            # ✅ пишем исходящее
-            await store.add_message({
+            # ✅ save outbound
+            await _safe_add_message({
                 "dir": "out",
                 "chatIdHash": chat_id_hash,
                 "chatId": msg["chatId"],
@@ -226,10 +247,13 @@ async def webhooks_alias(request: Request, background: BackgroundTasks):
 async def wazzup_webhook(request: Request, background: BackgroundTasks):
     _check_token(request)
 
-    payload = await request.json()
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "invalid_json"}, status_code=400)
+
     items = _payload_to_items(payload)
 
-    # если пришли только statuses / wrappers — просто 200 OK
     if not items:
         return JSONResponse({"ok": True, "ignored": True})
 
