@@ -908,7 +908,7 @@ class DialogManager:
                             return BotReply(text=self._ops_template("complaint"))
 
                         await self._save_session(chat_id_hash, session)
-                        return BotReply(text="Уточните, пожалуйста, номер поезда, дату поездки и примерное время (например: вчера 19:00 или 01.02.2026 18:30).")
+                        return BotReply(text="Уточните, пожалуйста,дату поездки и примерное время (например: вчера 19:00 или 01.02.2026 18:30).")
 
                     if not cs.get("complaintText"):
                         if session.get("mode") == "new_case":
